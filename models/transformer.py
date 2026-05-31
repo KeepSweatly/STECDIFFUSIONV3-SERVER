@@ -159,6 +159,7 @@ class STECDiffTransformer(nn.Module):
 
         # 系统ID嵌入（GPS=0, GLONASS=1, Galileo=2, BDS=3, ...）
         # 假设最多支持 4 个系统，padding_idx=0 用于 padding 点，1-4 为已知系统
+        # Must match data.dataset.map_system_id_to_index: 0=padding, 1-4=known systems,
         self.system_embed = nn.Embedding(5, system_emb_dim, padding_idx=0)
         # 将 system_emb_dim 映射到 dim
         self.system_proj = nn.Linear(system_emb_dim, dim, bias=True)

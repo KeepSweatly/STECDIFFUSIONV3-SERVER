@@ -11,7 +11,7 @@ STEC 条件扩散模型推理/测试入口脚本（多星联合版本）
     cd D:/Phd/IonoModeling/stec_diffusionv2
     python scripts/test.py
     python scripts/test.py --config configs/default.yaml
-    python scripts/test.py --checkpoint experiments/exp_joint_epoch/checkpoints/ckpt_best.pth
+    python scripts/test.py --checkpoint experiments/exp_joint_epoch_BDS/checkpoints/ckpt_best.pth
     python scripts/test.py --verbose
 
 核心功能：
@@ -56,6 +56,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -84,118 +85,229 @@ def load_normalizers(norm_path: str):
     return coord_norm, stec_norm, angle_norm
 
 
-def predict_epoch(
-    model,
-    sde: STEC_IRSDE,
-    model_df: pd.DataFrame,
-    val_df: pd.DataFrame,
+def _extract_epoch_arrays(model_df: pd.DataFrame, val_df: pd.DataFrame, system_ascii_code):
+    """从两个 DataFrame 提取并过滤出单历元所需的 numpy 数组。"""
+    if system_ascii_code is not None:
+        model_df = model_df[model_df["system_id"] == system_ascii_code].reset_index(drop=True)
+        val_df   = val_df[val_df["system_id"]   == system_ascii_code].reset_index(drop=True)
+
+    ctx_lats    = model_df["ipp_latitude"].values.astype(np.float32)
+    ctx_lons    = model_df["ipp_longitude"].values.astype(np.float32)
+    ctx_az      = model_df["azimuth_deg"].values.astype(np.float32)
+    ctx_el      = model_df["elevation_deg"].values.astype(np.float32)
+    ctx_stec    = model_df["stec"].values.astype(np.float32)
+    ctx_sys_ids = map_system_id_to_index(model_df["system_id"].values.astype(np.int64))
+    ctx_sat_ids = model_df["satellite_id"].values.astype(np.int64)
+    ctx_stations = model_df["station_name"].tolist()
+
+    tgt_lats    = val_df["ipp_latitude"].values.astype(np.float32)
+    tgt_lons    = val_df["ipp_longitude"].values.astype(np.float32)
+    tgt_az      = val_df["azimuth_deg"].values.astype(np.float32)
+    tgt_el      = val_df["elevation_deg"].values.astype(np.float32)
+    tgt_stec    = val_df["stec"].values.astype(np.float32)
+    tgt_sys_ids = map_system_id_to_index(val_df["system_id"].values.astype(np.int64))
+    tgt_sat_ids = val_df["satellite_id"].values.astype(np.int64)
+    tgt_stations = val_df["station_name"].tolist()
+
+    return (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec, ctx_sys_ids, ctx_sat_ids, ctx_stations,
+            tgt_lats, tgt_lons, tgt_az, tgt_el, tgt_stec, tgt_sys_ids, tgt_sat_ids, tgt_stations)
+
+
+def estimate_infer_batch_size(
+    valid_epochs: list,
+    model_files: dict,
+    val_files: dict,
+    system_ascii_code,
+    device: torch.device,
+    model_n_params: int,
+    model_dim: int = 256,
+    model_depth: int = 3,
+    max_batch: int = 32,
+) -> int:
+    """
+    根据 GPU 可用显存自动估算推理 batch size。
+
+    采样前 min(20, N) 个历元的点数，取 P95 作为代表性点数，
+    用经验公式估算单样本激活显存，结合可用显存得到 batch size。
+    CPU 设备直接返回 1。
+    """
+    if device.type != "cuda":
+        return 1
+
+    # 采样点数
+    sample_n = min(20, len(valid_epochs))
+    point_counts = []
+    for stem in valid_epochs[:sample_n]:
+        mdf = pd.read_csv(model_files[stem])
+        vdf = pd.read_csv(val_files[stem])
+        if system_ascii_code is not None:
+            mdf = mdf[mdf["system_id"] == system_ascii_code]
+            vdf = vdf[vdf["system_id"] == system_ascii_code]
+        point_counts.append(len(mdf) + len(vdf))
+
+    n_max_repr = int(np.percentile(point_counts, 95)) if point_counts else 512
+
+    # 经验公式：激活显存 ≈ N × dim × depth × 4 tensors × 4 bytes × 保守系数3
+    bytes_per_sample = n_max_repr * model_dim * model_depth * 4 * 4 * 3
+    # 模型参数固定占用（fp32）
+    model_bytes = model_n_params * 4
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    # 留出 20% 余量
+    usable_bytes = free_bytes * 0.8 - model_bytes
+    if usable_bytes <= 0:
+        return 1
+
+    batch_size = max(1, min(int(usable_bytes // bytes_per_sample), max_batch))
+    print(f"[InferBatch] 代表性点数={n_max_repr}, 可用显存={free_bytes/1e9:.1f}GB, "
+          f"估算 infer_batch_size={batch_size}")
+    return batch_size
+
+
+def collate_inference_batch(
+    epoch_data_list: list,
     coord_norm: CoordNormalizer,
     stec_norm: STECNormalizer,
     angle_norm: CoordNormalizer,
     device: torch.device,
-    verbose: bool = False,
-) -> pd.DataFrame:
+):
     """
-    对单个历元进行推理预测。
-
-    context 点：model_stations 的所有 IPP 点（全部）
-    target 点：val_stations 的所有 IPP 点（全部）
+    将多个历元的数据打包成一个 batch tensor，用于批量推理。
 
     Args:
-        model:      训练好的模型
-        sde:        SDE 实例
-        model_df:   该历元的 model_stations 数据（context）
-        val_df:     该历元的 val_stations 数据（target）
-        coord_norm: 坐标归一化器
-        stec_norm:  STEC 归一化器
-        angle_norm: 角度归一化器
-        device:     设备
-        verbose:    是否打印进度
+        epoch_data_list: list of tuples，每个元素为 _extract_epoch_arrays 的返回值
+        coord_norm, stec_norm, angle_norm: 归一化器
+        device: 目标设备
 
     Returns:
-        result_df: 包含预测结果和元信息的 DataFrame
+        batch_tensors: dict，包含 coords/angles/stec_full/sys_ids/valid_mask/
+                       context_mask/target_mask/role_type/context_stec，均为 [B, N_max, *]
+        meta_list: list of dict，每个历元的元信息（n_ctx, tgt_* 原始数组）
     """
-    # 提取 context（model_stations）数据
-    ctx_lats     = model_df["ipp_latitude"].values.astype(np.float32)
-    ctx_lons     = model_df["ipp_longitude"].values.astype(np.float32)
-    ctx_az       = model_df["azimuth_deg"].values.astype(np.float32)
-    ctx_el       = model_df["elevation_deg"].values.astype(np.float32)
-    ctx_stec     = model_df["stec"].values.astype(np.float32)
-    ctx_sys_ids  = model_df["system_id"].values.astype(np.int64)
-    ctx_sys_ids  = map_system_id_to_index(ctx_sys_ids)
-    ctx_sat_ids  = model_df["satellite_id"].values.astype(np.int64)
-    ctx_stations = model_df["station_name"].tolist()
+    B = len(epoch_data_list)
+    n_totals = []
+    normalized_list = []
+    meta_list = []
 
-    # 提取 target（val_stations）数据
-    tgt_lats     = val_df["ipp_latitude"].values.astype(np.float32)
-    tgt_lons     = val_df["ipp_longitude"].values.astype(np.float32)
-    tgt_az       = val_df["azimuth_deg"].values.astype(np.float32)
-    tgt_el       = val_df["elevation_deg"].values.astype(np.float32)
-    tgt_stec     = val_df["stec"].values.astype(np.float32)
-    tgt_sys_ids  = val_df["system_id"].values.astype(np.int64)
-    tgt_sys_ids  = map_system_id_to_index(tgt_sys_ids)
-    tgt_sat_ids  = val_df["satellite_id"].values.astype(np.int64)
-    tgt_stations = val_df["station_name"].tolist()
+    for data in epoch_data_list:
+        (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
+         ctx_sys_ids, ctx_sat_ids, ctx_stations,
+         tgt_lats, tgt_lons, tgt_az, tgt_el, tgt_stec,
+         tgt_sys_ids, tgt_sat_ids, tgt_stations) = data
 
-    n_ctx = len(ctx_lats)
-    n_tgt = len(tgt_lats)
-    n_total = n_ctx + n_tgt
+        n_ctx = len(ctx_lats)
+        n_tgt = len(tgt_lats)
+        n_total = n_ctx + n_tgt
 
-    # 合并 context + target 为完整样本
-    all_lats    = np.concatenate([ctx_lats, tgt_lats])
-    all_lons    = np.concatenate([ctx_lons, tgt_lons])
-    all_az      = np.concatenate([ctx_az, tgt_az])
-    all_el      = np.concatenate([ctx_el, tgt_el])
-    all_stec    = np.concatenate([ctx_stec, tgt_stec])
-    all_sys_ids = np.concatenate([ctx_sys_ids, tgt_sys_ids])
+        all_lats    = np.concatenate([ctx_lats, tgt_lats])
+        all_lons    = np.concatenate([ctx_lons, tgt_lons])
+        all_az      = np.concatenate([ctx_az,   tgt_az])
+        all_el      = np.concatenate([ctx_el,   tgt_el])
+        all_stec    = np.concatenate([ctx_stec, tgt_stec])
+        all_sys_ids = np.concatenate([ctx_sys_ids, tgt_sys_ids])
 
-    # 归一化
-    coords_norm = coord_norm.transform(all_lats, all_lons)            # [N, 2]
-    angles_norm = angle_norm.transform(all_az, all_el)                # [N, 2]
-    stec_norm_v = stec_norm.transform(all_stec)[:, np.newaxis]       # [N, 1]
+        coords_n = coord_norm.transform(all_lats, all_lons).astype(np.float32)   # [N, 2]
+        angles_n = angle_norm.transform(all_az, all_el).astype(np.float32)       # [N, 2]
+        stec_n   = stec_norm.transform(all_stec).astype(np.float32)[:, None]     # [N, 1]
 
-    # 转为 tensor（batch_size=1）
-    coords    = torch.from_numpy(coords_norm).unsqueeze(0).to(device)   # [1, N, 2]
-    angles    = torch.from_numpy(angles_norm).unsqueeze(0).to(device)   # [1, N, 2]
-    sys_ids_t = torch.from_numpy(all_sys_ids).unsqueeze(0).to(device)   # [1, N]
-    stec_full = torch.from_numpy(stec_norm_v).unsqueeze(0).to(device)   # [1, N, 1]
+        n_totals.append(n_total)
+        normalized_list.append((coords_n, angles_n, stec_n, all_sys_ids, n_ctx))
+        meta_list.append({
+            "n_ctx": n_ctx, "n_tgt": n_tgt,
+            "tgt_lats": tgt_lats, "tgt_lons": tgt_lons,
+            "tgt_az": tgt_az, "tgt_el": tgt_el,
+            "tgt_stec": tgt_stec,
+            "tgt_sys_ids": tgt_sys_ids, "tgt_sat_ids": tgt_sat_ids,
+            "tgt_stations": tgt_stations,
+        })
 
-    # 构建 mask
-    N = n_total
-    valid_mask   = torch.ones(1, N, dtype=torch.bool, device=device)
-    context_mask = torch.zeros(1, N, dtype=torch.bool, device=device)
-    target_mask  = torch.zeros(1, N, dtype=torch.bool, device=device)
+    N_max = max(n_totals)
 
-    context_mask[0, :n_ctx] = True
-    target_mask[0, n_ctx:]  = True
+    coords_b    = np.zeros((B, N_max, 2), dtype=np.float32)
+    angles_b    = np.zeros((B, N_max, 2), dtype=np.float32)
+    stec_b      = np.zeros((B, N_max, 1), dtype=np.float32)
+    sys_ids_b   = np.zeros((B, N_max),    dtype=np.int64)
+    valid_b     = np.zeros((B, N_max),    dtype=bool)
+    ctx_mask_b  = np.zeros((B, N_max),    dtype=bool)
+    tgt_mask_b  = np.zeros((B, N_max),    dtype=bool)
 
-    # 构建 role_type
-    role_type = torch.zeros(1, N, dtype=torch.long, device=device)
-    role_type[context_mask] = 1
-    role_type[target_mask]  = 2
+    for i, (coords_n, angles_n, stec_n, all_sys_ids, n_ctx) in enumerate(normalized_list):
+        n = n_totals[i]
+        coords_b[i, :n]   = coords_n
+        angles_b[i, :n]   = angles_n
+        stec_b[i, :n]     = stec_n
+        sys_ids_b[i, :n]  = all_sys_ids
+        valid_b[i, :n]    = True
+        ctx_mask_b[i, :n_ctx]    = True
+        tgt_mask_b[i, n_ctx:n]   = True
 
-    # context_stec
-    context_stec = stec_full * context_mask.unsqueeze(-1).float()
+    coords_t    = torch.from_numpy(coords_b).to(device)
+    angles_t    = torch.from_numpy(angles_b).to(device)
+    stec_t      = torch.from_numpy(stec_b).to(device)
+    sys_ids_t   = torch.from_numpy(sys_ids_b).to(device)
+    valid_t     = torch.from_numpy(valid_b).to(device)
+    ctx_mask_t  = torch.from_numpy(ctx_mask_b).to(device)
+    tgt_mask_t  = torch.from_numpy(tgt_mask_b).to(device)
 
-    # 构建条件均值 μ 和先验特征
+    role_type = torch.zeros(B, N_max, dtype=torch.long, device=device)
+    role_type[ctx_mask_t] = 1
+    role_type[tgt_mask_t] = 2
+
+    ctx_stec_t = stec_t * ctx_mask_t.unsqueeze(-1).float()
+
+    batch_tensors = {
+        "coords":        coords_t,
+        "angles":        angles_t,
+        "stec_full":     stec_t,
+        "sys_ids":       sys_ids_t,
+        "valid_mask":    valid_t,
+        "context_mask":  ctx_mask_t,
+        "target_mask":   tgt_mask_t,
+        "role_type":     role_type,
+        "context_stec":  ctx_stec_t,
+    }
+    return batch_tensors, meta_list
+
+
+def predict_batch(
+    model,
+    sde: STEC_IRSDE,
+    batch_tensors: dict,
+    meta_list: list,
+    stec_norm: STECNormalizer,
+    device: torch.device,
+    verbose: bool = False,
+) -> list:
+    """
+    对一个 batch 的历元执行批量反向 SDE 推理，返回各历元的 result_df 列表。
+    """
+    coords       = batch_tensors["coords"]
+    angles       = batch_tensors["angles"]
+    stec_full    = batch_tensors["stec_full"]
+    sys_ids      = batch_tensors["sys_ids"]
+    valid_mask   = batch_tensors["valid_mask"]
+    context_mask = batch_tensors["context_mask"]
+    target_mask  = batch_tensors["target_mask"]
+    role_type    = batch_tensors["role_type"]
+    context_stec = batch_tensors["context_stec"]
+
     mu, prior_features = sde.build_mu_batch(
         coords, stec_full, context_mask, target_mask,
         return_prior_features=True,
     )
 
-    # 初始化推理起始噪声状态
+    # 初始化噪声起始状态（仅 target 点）
     x_T = stec_full.clone()
     target_noise = mu + sde.max_sigma * torch.randn_like(stec_full)
     x_T[target_mask] = target_noise[target_mask]
 
-    # 完整反向 SDE 去噪
     x0_pred = sde.reverse_sde(
         x_T=x_T,
         mu=mu,
         model=model,
         coords=coords,
         angles=angles,
-        system_ids=sys_ids_t,
+        system_ids=sys_ids,
         context_stec=context_stec,
         role_type=role_type,
         valid_mask=valid_mask,
@@ -203,31 +315,33 @@ def predict_epoch(
         device=device,
         prior_features=prior_features,
         verbose=verbose,
-    )
+    )  # [B, N_max, 1]
 
-    # 提取 target 点的预测结果
-    pred_norm_vals = x0_pred[0, n_ctx:, 0].cpu().numpy()     # [n_tgt]
-    true_norm_vals = stec_full[0, n_ctx:, 0].cpu().numpy()   # [n_tgt]
+    result_dfs = []
+    for i, meta in enumerate(meta_list):
+        n_ctx = meta["n_ctx"]
+        n_tgt = meta["n_tgt"]
 
-    # 反归一化
-    pred_orig = stec_norm.inverse_transform(pred_norm_vals)
-    true_orig = stec_norm.inverse_transform(true_norm_vals)
+        pred_norm = x0_pred[i, n_ctx:n_ctx + n_tgt, 0].cpu().numpy()
+        true_norm = stec_full[i, n_ctx:n_ctx + n_tgt, 0].cpu().numpy()
 
-    # 构建结果 DataFrame（保留所有元信息，便于后续按 satellite_id 分析）
-    result_df = pd.DataFrame({
-        "station_name":  tgt_stations,
-        "ipp_latitude":  tgt_lats,
-        "ipp_longitude": tgt_lons,
-        "azimuth_deg":   tgt_az,
-        "elevation_deg": tgt_el,
-        "system_id":     tgt_sys_ids,
-        "satellite_id":  tgt_sat_ids,
-        "true_stec":     true_orig,
-        "pred_stec":     pred_orig,
-        "abs_error":     np.abs(pred_orig - true_orig),
-    })
+        pred_orig = stec_norm.inverse_transform(pred_norm)
+        true_orig = stec_norm.inverse_transform(true_norm)
 
-    return result_df
+        result_dfs.append(pd.DataFrame({
+            "station_name":  meta["tgt_stations"],
+            "ipp_latitude":  meta["tgt_lats"],
+            "ipp_longitude": meta["tgt_lons"],
+            "azimuth_deg":   meta["tgt_az"],
+            "elevation_deg": meta["tgt_el"],
+            "system_id":     meta["tgt_sys_ids"],
+            "satellite_id":  meta["tgt_sat_ids"],
+            "true_stec":     true_orig,
+            "pred_stec":     pred_orig,
+            "abs_error":     np.abs(pred_orig - true_orig),
+        }))
+
+    return result_dfs
 
 
 def main():
@@ -298,6 +412,26 @@ def main():
         print("[Error] 没有共同的历元文件，无法测试")
         return
 
+    # 时间段过滤（文件名格式：20240218_000000-STEC，截取前 11 位即 YYYYMMDD_HH）
+    test_time_start = cfg["inference"].get("test_time_start", None)
+    test_time_end   = cfg["inference"].get("test_time_end", None)
+    if test_time_start or test_time_end:
+        filtered_stems = []
+        for stem in common_stems:
+            stem_hour = stem[:11]  # "20240218_00"
+            if test_time_start and stem_hour < test_time_start:
+                continue
+            if test_time_end and stem_hour > test_time_end:
+                continue
+            filtered_stems.append(stem)
+        print(f"  时间段过滤：{test_time_start or '不限'} ~ {test_time_end or '不限'}")
+        print(f"  过滤后共同历元：{len(filtered_stems)} 个（原 {len(common_stems)} 个）")
+        common_stems = filtered_stems
+
+        if not common_stems:
+            print("[Error] 时间段过滤后没有历元文件")
+            return
+
     # 过滤：context IPP 数 < min_test_context_ipps 或 target IPP 数 < min_test_target_ipps
     min_ctx_ipps = cfg["data"].get("min_test_context_ipps", 20)
     min_tgt_ipps = cfg["data"].get("min_test_target_ipps", 10)
@@ -322,11 +456,28 @@ def main():
     # 2. 加载模型和归一化参数
     # ------------------------------------------------------------------
     print("\n[2/5] 加载模型和归一化参数...")
-    exp_name = cfg["experiment"]["name"]
-    if system_filter:
-        exp_name = f"{exp_name}_{system_filter}"
-    out_dir  = cfg["experiment"]["output_dir"]
-    exp_dir  = os.path.join(project_root, out_dir, exp_name)
+
+    # 构建与训练时相同的 setting_tag，定位实验目录
+    _m   = cfg["model"]
+    _sde = cfg["sde"]
+    _mu  = cfg.get("mu_reg", {})
+    _tr  = cfg["training"]
+    _inf = cfg["inference"]
+    _dat = cfg["data"]
+    sys_tag = f"_{system_filter}" if system_filter else ""
+    setting_tag = (
+        f"chp_joint{sys_tag}"
+        f"_d{_m['dim']}_L{_m['depth']}"
+        f"_h{_m['heads']}_mr{_m['mlp_ratio']}"
+        f"_sig{_sde['max_sigma']}_g{_mu.get('guidance_scale_max', 2.0)}"
+        f"_lr{_tr['learning_rate']}_bs{_tr['batch_size']}"
+        f"_ik{_inf['idw_k']}_ip{_inf['idw_power']}"
+        f"_mmi{_dat['mask_ratio_min']}_mma{_dat['mask_ratio_max']}"
+        f"_wcd{_mu.get('weak_context_dropout', 0.3)}"
+    )
+
+    out_dir = cfg["experiment"]["output_dir"]
+    exp_dir = os.path.join(project_root, out_dir, setting_tag)
 
     norm_path = os.path.join(exp_dir, "normalizer.json")
     if not os.path.exists(norm_path):
@@ -360,7 +511,7 @@ def main():
     sde_cfg = cfg["sde"]
     mu_reg_cfg = cfg.get("mu_reg", {})
     sde = STEC_IRSDE(
-        max_sigma=sde_cfg.get("max_sigma", 50.0),
+        max_sigma=sde_cfg.get("max_sigma", 2.0),
         T=sde_cfg.get("T", 100),
         schedule=sde_cfg.get("schedule", "cosine"),
         eps=sde_cfg.get("eps", 1e-8),
@@ -372,43 +523,81 @@ def main():
         guidance_schedule=mu_reg_cfg.get("guidance_schedule", "sin2"),
         weak_context_dropout=mu_reg_cfg.get("weak_context_dropout", 0.3),
         use_reg=mu_reg_cfg.get("use_reg", True),
+        prior_unc_a1=mu_reg_cfg.get("prior_unc_a1", 1.0),
+        prior_unc_a2=mu_reg_cfg.get("prior_unc_a2", 1.0),
+        prior_unc_a3=mu_reg_cfg.get("prior_unc_a3", 0.5),
+        prior_gap_k2=mu_reg_cfg.get("prior_gap_k2", 2),
     )
 
     # ------------------------------------------------------------------
-    # 4. 推理预测
+    # 4. 推理预测（批量并行）
     # ------------------------------------------------------------------
-    print(f"\n[4/5] 推理预测（共 {len(valid_epochs)} 个历元）...")
+    # 自动估算 batch size
+    infer_batch_size = estimate_infer_batch_size(
+        valid_epochs=valid_epochs,
+        model_files=model_files,
+        val_files=val_files,
+        system_ascii_code=system_ascii_code,
+        device=device,
+        model_n_params=sum(p.numel() for p in model.parameters()),
+        model_dim=cfg["model"].get("dim", 256),
+        model_depth=cfg["model"].get("depth", 3),
+    )
+
+    n_epochs = len(valid_epochs)
+    n_batches = (n_epochs + infer_batch_size - 1) // infer_batch_size
+    print(f"\n[4/5] 推理预测（共 {n_epochs} 个历元，batch_size={infer_batch_size}，共 {n_batches} 个 batch）...")
     all_results = []
+    n_done = 0
 
-    for i, stem in enumerate(valid_epochs):
-        if args.verbose or (i + 1) % 10 == 0 or i == 0:
-            print(f"  [{i+1}/{len(valid_epochs)}] 处理历元：{stem}")
+    for batch_idx in range(n_batches):
+        batch_stems = valid_epochs[batch_idx * infer_batch_size : (batch_idx + 1) * infer_batch_size]
 
-        model_df_i = pd.read_csv(model_files[stem])
-        val_df_i   = pd.read_csv(val_files[stem])
+        # 读取并提取每个历元的数组
+        epoch_data_list = []
+        stem_list = []
+        for stem in batch_stems:
+            model_df_i = pd.read_csv(model_files[stem])
+            val_df_i   = pd.read_csv(val_files[stem])
+            try:
+                data = _extract_epoch_arrays(model_df_i, val_df_i, system_ascii_code)
+                epoch_data_list.append(data)
+                stem_list.append(stem)
+            except Exception as e:
+                print(f"    [Warning] 历元 {stem} 数据提取失败：{e}")
 
-        # 按系统过滤
-        if system_ascii_code is not None:
-            model_df_i = model_df_i[model_df_i["system_id"] == system_ascii_code].reset_index(drop=True)
-            val_df_i   = val_df_i[val_df_i["system_id"] == system_ascii_code].reset_index(drop=True)
+        if not epoch_data_list:
+            continue
 
         try:
-            result_df = predict_epoch(
+            batch_tensors, meta_list = collate_inference_batch(
+                epoch_data_list, coord_norm, stec_norm, angle_norm, device
+            )
+            result_dfs = predict_batch(
                 model=model,
                 sde=sde,
-                model_df=model_df_i,
-                val_df=val_df_i,
-                coord_norm=coord_norm,
+                batch_tensors=batch_tensors,
+                meta_list=meta_list,
                 stec_norm=stec_norm,
-                angle_norm=angle_norm,
                 device=device,
                 verbose=args.verbose,
             )
-            result_df["epoch_time"] = stem
-            all_results.append(result_df)
+            for stem, rdf in zip(stem_list, result_dfs):
+                rdf["epoch_time"] = stem
+                all_results.append(rdf)
         except Exception as e:
-            print(f"    [Warning] 历元 {stem} 推理失败：{e}")
-            continue
+            print(f"    [Warning] batch {batch_idx+1}/{n_batches} 推理失败：{e}，逐历元回退...")
+            for stem, data in zip(stem_list, epoch_data_list):
+                try:
+                    bt, ml = collate_inference_batch([data], coord_norm, stec_norm, angle_norm, device)
+                    rdfs = predict_batch(model, sde, bt, ml, stec_norm, device, args.verbose)
+                    rdfs[0]["epoch_time"] = stem
+                    all_results.append(rdfs[0])
+                except Exception as e2:
+                    print(f"    [Warning] 历元 {stem} 推理失败：{e2}")
+
+        n_done += len(stem_list)
+        print(f"  [{batch_idx+1}/{n_batches}] 已完成 {n_done}/{n_epochs} 个历元")
 
     if not all_results:
         print("[Error] 所有历元推理均失败")
@@ -420,9 +609,9 @@ def main():
     # 5. 导出结果
     # ------------------------------------------------------------------
     print(f"\n[5/5] 导出结果...")
-    result_dir = os.path.join(project_root, cfg["inference"].get("result_output_dir", "results/final_test"))
-    if system_filter:
-        result_dir = f"{result_dir}_{system_filter}"
+    result_base = cfg["inference"].get("result_output_dir", "results/final_test")
+    result_base_dir = os.path.dirname(result_base)  # "results"
+    result_dir = os.path.join(project_root, result_base_dir, f"Test_{setting_tag}")
     os.makedirs(result_dir, exist_ok=True)
 
     # 导出完整结果（所有卫星，所有历元）
@@ -485,6 +674,63 @@ def main():
     summary_path = os.path.join(result_dir, "summary_by_satellite.csv")
     summary_df.to_csv(summary_path, index=False)
     print(f"\n  分组统计摘要：{summary_path}")
+
+    # ------------------------------------------------------------------
+    # 按测站统计 IPP 建模精度
+    # ------------------------------------------------------------------
+    print(f"\n  按测站统计指标：")
+    station_rows = []
+    for station, grp in final_results.groupby("station_name"):
+        mae_s  = float(grp["abs_error"].mean())
+        rmse_s = float(np.sqrt((grp["abs_error"] ** 2).mean()))
+        n_pts  = len(grp)
+        print(f"    {station}: MAE={mae_s:.4f}  RMSE={rmse_s:.4f}  N={n_pts}")
+        station_rows.append({
+            "station_name": station,
+            "n_points":     n_pts,
+            "mae_tecu":     mae_s,
+            "rmse_tecu":    rmse_s,
+        })
+
+    station_df = pd.DataFrame(station_rows)
+    station_path = os.path.join(result_dir, "summary_by_station.csv")
+    station_df.to_csv(station_path, index=False)
+    print(f"  测站统计摘要：{station_path}")
+
+    # ------------------------------------------------------------------
+    # 按 30 分钟时段统计 IPP 建模精度
+    # ------------------------------------------------------------------
+    print(f"\n  按 30 分钟时段统计指标：")
+
+    def stem_to_datetime(stem: str) -> datetime:
+        ts = stem.split("-")[0]  # "20240218_000000"
+        return datetime.strptime(ts, "%Y%m%d_%H%M%S")
+
+    final_results["datetime"] = final_results["epoch_time"].apply(stem_to_datetime)
+    final_results["time_slot"] = final_results["datetime"].apply(
+        lambda dt: dt.replace(minute=(dt.minute // 30) * 30, second=0).strftime("%Y%m%d_%H%M")
+    )
+
+    slot_rows = []
+    for slot, grp in final_results.groupby("time_slot"):
+        mae_t  = float(grp["abs_error"].mean())
+        rmse_t = float(np.sqrt((grp["abs_error"] ** 2).mean()))
+        n_pts  = len(grp)
+        print(f"    {slot}: MAE={mae_t:.4f}  RMSE={rmse_t:.4f}  N={n_pts}")
+        slot_rows.append({
+            "time_slot":  slot,
+            "n_points":   n_pts,
+            "mae_tecu":   mae_t,
+            "rmse_tecu":  rmse_t,
+        })
+
+    slot_df = pd.DataFrame(slot_rows)
+    slot_path = os.path.join(result_dir, "summary_by_timeslot_30min.csv")
+    slot_df.to_csv(slot_path, index=False)
+    print(f"  时段统计摘要：{slot_path}")
+
+    # 清理临时列
+    final_results.drop(columns=["datetime", "time_slot"], inplace=True)
 
     # 导出整体指标 JSON
     metrics = {

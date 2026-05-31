@@ -145,11 +145,15 @@ class STEC_IRSDE:
         guidance_beta (float):       空间自适应抑制系数（默认 1.0）
         guidance_schedule (str):     时步调度策略：'sin2' / 'linear' / 'constant'
         weak_context_dropout (float): 弱条件分支 context dropout 比例（默认 0.3）
+        prior_unc_a1 (float):        prior_unc 距离项权重
+        prior_unc_a2 (float):        prior_unc 邻域标准差项权重
+        prior_unc_a3 (float):        prior_unc 凸包外指示项权重
+        prior_gap_k2 (int):          prior_gap 的对照 IDW 邻居数
     """
 
     def __init__(
         self,
-        max_sigma: float = 50.0,
+        max_sigma: float = 2.0,
         T: int = 100,
         schedule: str = "cosine",
         eps: float = 1e-8,
@@ -161,6 +165,10 @@ class STEC_IRSDE:
         guidance_schedule: str = "sin2",
         weak_context_dropout: float = 0.3,
         use_reg: bool = True,
+        prior_unc_a1: float = 1.0,
+        prior_unc_a2: float = 1.0,
+        prior_unc_a3: float = 0.5,
+        prior_gap_k2: int = 2,
     ):
         self.max_sigma = max_sigma
         self.T         = T
@@ -178,6 +186,10 @@ class STEC_IRSDE:
 
         # REG 矫正开关（True=使用REG Jacobian矫正，False=普通CFG风格）
         self.use_reg = use_reg
+        self.prior_unc_a1 = prior_unc_a1
+        self.prior_unc_a2 = prior_unc_a2
+        self.prior_unc_a3 = prior_unc_a3
+        self.prior_gap_k2 = prior_gap_k2
 
         # 预计算各时间步的 sigma_bar 和 alpha（mu_bar 系数）
         self._build_schedule()
@@ -349,15 +361,19 @@ class STEC_IRSDE:
             noise:  [B, N_max, 1]
             mean_t: [B, N_max, 1]
         """
-        B = x0.shape[0]
-        xt     = torch.zeros_like(x0)
-        noise  = torch.zeros_like(x0)
-        mean_t = torch.zeros_like(x0)
+        # 向量化：将 sigma/alpha 按样本广播，避免 Python 循环
+        sigma_arr = torch.tensor(
+            [self._sigma_bar[int(t.item()) - 1] for t in t_batch],
+            dtype=x0.dtype, device=x0.device,
+        ).view(-1, 1, 1)  # [B, 1, 1]
+        alpha_arr = torch.tensor(
+            [self._alpha[int(t.item()) - 1] for t in t_batch],
+            dtype=x0.dtype, device=x0.device,
+        ).view(-1, 1, 1)  # [B, 1, 1]
 
-        for i in range(B):
-            t_i = int(t_batch[i].item())
-            xt[i], noise[i], mean_t[i] = self.forward_sample(x0[i], mu[i], t_i)
-
+        mean_t = mu + alpha_arr * (x0 - mu)
+        noise  = torch.randn_like(x0)
+        xt     = mean_t + sigma_arr * noise
         return xt, noise, mean_t
 
     def build_mu_batch(
@@ -376,7 +392,7 @@ class STEC_IRSDE:
         当 return_prior_features=True 时，额外计算：
           - prior_mu:  μ_IDW(k=5)，即主先验均值
           - prior_unc: u(p) = a1*d_kNN + a2*Std_kNN + a3*outside_hull
-          - prior_gap: Δμ = μ_IDW(k=5) - μ_IDW(k=2)
+          - prior_gap: Δμ = μ_IDW(k=idw_k) - μ_IDW(k=prior_gap_k2)
 
         Args:
             coords:       [B, N_max, 2]  归一化坐标
@@ -431,10 +447,10 @@ class STEC_IRSDE:
                     # 1. prior_mu: 就是 μ_IDW(k=5)
                     prior_mu_target = mu_target  # [M, 1]
 
-                    # 2. prior_gap: Δμ = μ_IDW(k=5) - μ_IDW(k=2)
+                    # 2. prior_gap: Δμ = μ_IDW(k=idw_k) - μ_IDW(k=prior_gap_k2)
                     mu_target_k2 = idw_interpolate(
                         t_coords, c_coords, c_stec,
-                        power=self.idw_power, k=2,
+                        power=self.idw_power, k=self.prior_gap_k2,
                     )  # [M, 1]
                     prior_gap_target = mu_target - mu_target_k2  # [M, 1]
 
@@ -459,9 +475,12 @@ class STEC_IRSDE:
                     # 更严格的凸包判断需要计算几何，这里简化为距离阈值
                     outside_hull = (d_knn > 0.3).float()  # [M, 1]，阈值 0.3 可调 ,这里是指的是选取的几个最临近点的距离的平均值是否大于阈值
 
-                    # 组合不确定度（权重系数可配置，这里用默认值）
-                    a1, a2, a3 = 1.0, 1.0, 0.5
-                    prior_unc_target = a1 * d_knn + a2 * std_knn + a3 * outside_hull  # [M, 1]
+                    # 组合不确定度（权重系数来自配置）
+                    prior_unc_target = (
+                        self.prior_unc_a1 * d_knn
+                        + self.prior_unc_a2 * std_knn
+                        + self.prior_unc_a3 * outside_hull
+                    )  # [M, 1]
 
                     # 归一化到 [0, 1]（使用 sigmoid 或 tanh）
                     prior_unc_target = torch.tanh(prior_unc_target)  # [M, 1]

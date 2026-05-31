@@ -98,6 +98,21 @@ def main():
         "--resume", type=str, default=None,
         help="从 checkpoint 恢复训练，传入 .pth 文件路径"
     )
+    parser.add_argument(
+        "--reset-scheduler",
+        action="store_true",
+        help="resume 时不加载 checkpoint 中的 scheduler 状态，改用当前配置重新初始化的 scheduler",
+    )
+    parser.add_argument(
+        "--reset-global-step",
+        action="store_true",
+        help="resume 时将 global_step 重置为 0，使 validation 步数从本次续训重新计数",
+    )
+    parser.add_argument(
+        "--no-test",
+        action="store_true",
+        help="训练完成后不自动运行 test.py 推理"
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -153,6 +168,7 @@ def main():
     train_ds, val_ds, coord_norm, stec_norm, angle_norm = build_train_val_datasets(
         model_stations_dir=model_stations_dir,
         cfg=cfg["data"],
+        cache_dir=os.path.join(project_root, ".dataset_cache"),
     )
 
     batch_size = cfg["training"]["batch_size"]
@@ -178,7 +194,7 @@ def main():
     sde_cfg = cfg["sde"]
     mu_reg_cfg = cfg.get("mu_reg", {})
     sde = STEC_IRSDE(
-        max_sigma=sde_cfg.get("max_sigma", 50.0),
+        max_sigma=sde_cfg.get("max_sigma", 2.0),
         T=sde_cfg.get("T", 100),
         schedule=sde_cfg.get("schedule", "cosine"),
         eps=sde_cfg.get("eps", 1e-8),
@@ -190,8 +206,12 @@ def main():
         guidance_schedule=mu_reg_cfg.get("guidance_schedule", "sin2"),
         weak_context_dropout=mu_reg_cfg.get("weak_context_dropout", 0.3),
         use_reg=mu_reg_cfg.get("use_reg", True),
+        prior_unc_a1=mu_reg_cfg.get("prior_unc_a1", 1.0),
+        prior_unc_a2=mu_reg_cfg.get("prior_unc_a2", 1.0),
+        prior_unc_a3=mu_reg_cfg.get("prior_unc_a3", 0.5),
+        prior_gap_k2=mu_reg_cfg.get("prior_gap_k2", 2),
     )
-    print(f"  SDE: T={sde.T}, max_sigma={sde_cfg.get('max_sigma', 50.0)}, "
+    print(f"  SDE: T={sde.T}, max_sigma={sde_cfg.get('max_sigma', 2.0)}, "
           f"schedule={sde_cfg.get('schedule', 'cosine')}, "
           f"guidance_scale_max={mu_reg_cfg.get('guidance_scale_max', 2.0)}")
 
@@ -199,11 +219,34 @@ def main():
     # 4. 保存归一化参数（供推理时复用）
     # ------------------------------------------------------------------
     print("\n[4/6] 保存归一化参数...")
-    exp_name = cfg["experiment"]["name"]
-    if system_filter:
-        exp_name = f"{exp_name}_{system_filter}"
+
+    # resume_lr：resume 时覆盖学习率（不纳入命名）
+    resume_lr = cfg["training"].get("resume_lr", None)
+    if args.resume and resume_lr is not None:
+        cfg["training"]["learning_rate"] = resume_lr
+        print(f"  [Resume] 学习率已覆盖为 resume_lr={resume_lr}")
+
+    # 构建 setting_tag（关键超参数编码）
+    _m   = cfg["model"]
+    _sde = cfg["sde"]
+    _mu  = cfg.get("mu_reg", {})
+    _tr  = cfg["training"]
+    _inf = cfg["inference"]
+    _dat = cfg["data"]
+    sys_tag = f"_{system_filter}" if system_filter else ""
+    setting_tag = (
+        f"chp_joint{sys_tag}"
+        f"_d{_m['dim']}_L{_m['depth']}"
+        f"_h{_m['heads']}_mr{_m['mlp_ratio']}"
+        f"_sig{_sde['max_sigma']}_g{_mu.get('guidance_scale_max', 2.0)}"
+        f"_lr{_tr['learning_rate']}_bs{_tr['batch_size']}"
+        f"_ik{_inf['idw_k']}_ip{_inf['idw_power']}"
+        f"_mmi{_dat['mask_ratio_min']}_mma{_dat['mask_ratio_max']}"
+        f"_wcd{_mu.get('weak_context_dropout', 0.3)}"
+    )
+
     out_dir = cfg["experiment"]["output_dir"]
-    exp_dir = os.path.join(project_root, out_dir, exp_name)
+    exp_dir = os.path.join(project_root, out_dir, setting_tag)
     os.makedirs(exp_dir, exist_ok=True)
 
     norm_path = os.path.join(exp_dir, "normalizer.json")
@@ -219,8 +262,8 @@ def main():
     # 5. 构建训练器
     # ------------------------------------------------------------------
     print("\n[5/6] 构建训练器...")
-    # 更新 cfg 中的实验名（带系统标识），确保 Trainer 使用正确的输出目录
-    cfg["experiment"]["name"] = exp_name
+    # 将 setting_tag 写回 cfg，确保 Trainer 使用正确的输出目录
+    cfg["experiment"]["name"] = setting_tag
     trainer = Trainer(
         model=model,
         sde=sde,
@@ -236,18 +279,26 @@ def main():
         if not os.path.exists(args.resume):
             print(f"[Error] checkpoint 文件不存在：{args.resume}")
             return
-        trainer.load_checkpoint(args.resume)
+        trainer.load_checkpoint(
+            args.resume,
+            reset_scheduler=args.reset_scheduler,
+            reset_global_step=args.reset_global_step,
+        )
         print(f"  已从 checkpoint 恢复：{args.resume}")
+        if args.reset_scheduler:
+            print("  Scheduler 状态已重置：使用当前配置重新调度学习率")
+        if args.reset_global_step:
+            print("  global_step 已重置为 0：validation 步数从本次续训重新计数")
 
     # ------------------------------------------------------------------
     # 6. 启动训练
     # ------------------------------------------------------------------
     print(f"\n[6/6] 启动训练...")
-    print(f"  实验名称：{exp_name}")
+    print(f"  实验标识：{setting_tag}")
     print(f"  输出目录：{exp_dir}")
     print(f"  训练轮数：{cfg['training']['num_epochs']}")
     accum_steps = cfg['training'].get('gradient_accumulation_steps', 1)
-    print(f"  批大小：{batch_size}（梯度累积 {accum_steps} 步，等效 batch={batch_size * accum_steps}）")
+    print(f"  批大小：{_tr['batch_size']}（梯度累积 {accum_steps} 步，等效 batch={_tr['batch_size'] * accum_steps}）")
     print(f"  学习率：{cfg['training']['learning_rate']}")
     print()
 
@@ -256,6 +307,28 @@ def main():
     print("\n" + "="*80)
     print("训练完成！")
     print("="*80)
+
+    # ------------------------------------------------------------------
+    # 7. 训练完成后自动运行推理测试
+    # ------------------------------------------------------------------
+    if not args.no_test:
+        print("\n[7/7] 训练完成，自动启动推理测试...")
+        import importlib.util
+        test_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.py")
+        spec = importlib.util.spec_from_file_location("test_module", test_script)
+        test_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(test_module)
+
+        # 构造 test.py 所需的 sys.argv（传入相同的 config）
+        import sys as _sys
+        _orig_argv = _sys.argv[:]
+        _sys.argv = ["test.py", "--config", args.config]
+        try:
+            test_module.main()
+        finally:
+            _sys.argv = _orig_argv
+    else:
+        print("\n[跳过] --no-test 已指定，不运行推理测试")
 
 
 if __name__ == "__main__":

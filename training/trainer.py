@@ -63,8 +63,8 @@ STEC 条件扩散模型训练器（多星联合版本）
     - weight_decay: 权重衰减系数
     - grad_clip: 梯度裁剪阈值
     - warmup_epochs: warmup 轮数
-    - val_start_step: 开始验证的步数
-    - val_interval: 验证间隔（步数）
+    - val_start_step: 开始验证的参数更新步数
+    - val_interval: 验证间隔（参数更新步数）
     - early_stopping_patience: early stopping 耐心值
     - mask_ratio_min/max: target 点比例范围
 
@@ -184,6 +184,7 @@ class Trainer:
         self.global_step = 0
         self.best_val_mae = float("inf")
         self.no_improve_count = 0  # early stopping 计数器
+        self._epoch_start_time: float = 0.0  # 用于计算训练速度
 
     # ------------------------------------------------------------------
     # 学习率 warmup
@@ -197,6 +198,50 @@ class Trainer:
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
+    def _after_optimizer_step(self, epoch: int, loss_dict: dict):
+        """Bookkeeping that should happen once per real parameter update."""
+        self.global_step += 1
+
+        if self.global_step % 100 == 0:
+            self.logger.debug(
+                f"  [Step {self.global_step}] "
+                f"L_total={loss_dict['loss_total'].item():.6f} "
+                f"L_strong={loss_dict['loss_strong'].item():.6f} "
+                f"L_weak={loss_dict['loss_weak'].item():.6f} "
+                f"L_x0={loss_dict['loss_x0'].item():.6f} "
+                f"L_jac={loss_dict['loss_jac'].item():.6f}"
+            )
+
+        if self.global_step >= self.val_start_step and self.global_step % self.val_interval == 0:
+            val_metrics = self._validate()
+            val_mae = val_metrics["mae_tecu"]
+            val_rmse = val_metrics["rmse_tecu"]
+            val_msg = (
+                f"  [Val @ step {self.global_step}] "
+                f"MAE={val_mae:.4f} TECU  RMSE={val_rmse:.4f} TECU  "
+                f"norm_MAE={val_metrics['mae_norm']:.4f}  norm_RMSE={val_metrics['rmse_norm']:.4f}  "
+                f"mu_baseline_MAE={val_metrics['mu_mae_tecu']:.4f} TECU  "
+                f"mu_baseline_RMSE={val_metrics['mu_rmse_tecu']:.4f} TECU  "
+                f"mu_norm_RMSE={val_metrics['mu_rmse_norm']:.4f}"
+            )
+            self.logger.info(val_msg)
+            print(val_msg)
+
+            if val_mae < self.best_val_mae:
+                self.best_val_mae = val_mae
+                self.no_improve_count = 0
+                self._save_checkpoint(epoch, tag="best")
+                improve_msg = f"  => 保存最佳模型(MAE={val_mae:.4f} TECU)"
+                self.logger.info(improve_msg)
+                print(improve_msg)
+            else:
+                self.no_improve_count += 1
+                no_improve_msg = f"  => 无改善(连续 {self.no_improve_count}/{self.early_stopping_patience})"
+                self.logger.info(no_improve_msg)
+                print(no_improve_msg)
+
+            self.model.train()
+
     # ------------------------------------------------------------------
     # 主训练入口
     # ------------------------------------------------------------------
@@ -205,7 +250,10 @@ class Trainer:
         """启动完整训练循环"""
         self.logger.info(f"开始训练,共 {self.num_epochs} 轮,设备:{self.device}")
         self.logger.info(f"实验目录:{self.exp_dir}")
-        self.logger.info(f"Validation 启动步数:{self.val_start_step},间隔:{self.val_interval}")
+        self.logger.info(
+            f"Validation 启动参数更新步数:{self.val_start_step},"
+            f"间隔:{self.val_interval} 次 optimizer.step"
+        )
         self.logger.info(f"Early stopping patience:{self.early_stopping_patience}")
         self.logger.info(f"梯度累积步数:{self.accum_steps},等效 batch_size={self.cfg['training']['batch_size'] * self.accum_steps}")
 
@@ -214,8 +262,12 @@ class Trainer:
             if epoch <= self.warmup_epochs:
                 self._warmup_lr(epoch)
 
+            epoch_t0 = time.time()
+
             # 训练一轮
             train_loss = self._train_epoch(epoch)
+
+            epoch_elapsed = time.time() - epoch_t0
 
             # 余弦调度(warmup 结束后)
             if epoch > self.warmup_epochs:
@@ -226,6 +278,17 @@ class Trainer:
                 f"[Epoch {epoch:03d}/{self.num_epochs}] "
                 f"loss={train_loss:.6f}  lr={cur_lr:.2e}  step={self.global_step}"
             )
+
+            # 每 10 个 epoch 打印一次训练速度
+            if epoch % 10 == 0 or epoch == self.start_epoch:
+                speed_msg = (
+                    f"[Speed] Epoch {epoch:03d}/{self.num_epochs}  "
+                    f"loss={train_loss:.6f}  lr={cur_lr:.2e}  "
+                    f"耗时={epoch_elapsed:.1f}s/epoch  "
+                    f"step={self.global_step}"
+                )
+                print(speed_msg)
+                self.logger.info(speed_msg)
 
             # 定期保存 checkpoint
             if epoch % self.save_every == 0:
@@ -339,7 +402,6 @@ class Trainer:
 
             total_loss += loss_dict["loss_total"].item()
             n_batches += 1
-            self.global_step += 1
 
             # ---- 10. 累积够步数后：裁剪梯度 + 更新参数 + 清零梯度 ----
             if (batch_idx + 1) % self.accum_steps == 0:
@@ -347,35 +409,7 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-
-            # 定期打印各项损失（每 100 步）
-            if self.global_step % 100 == 0:
-                self.logger.debug(
-                    f"  [Step {self.global_step}] "
-                    f"L_total={loss_dict['loss_total'].item():.6f} "
-                    f"L_strong={loss_dict['loss_strong'].item():.6f} "
-                    f"L_weak={loss_dict['loss_weak'].item():.6f} "
-                    f"L_x0={loss_dict['loss_x0'].item():.6f} "
-                    f"L_jac={loss_dict['loss_jac'].item():.6f}"
-                )
-
-            # ---- 11. 定期 validation ----
-            if self.global_step >= self.val_start_step and self.global_step % self.val_interval == 0:
-                val_mae, val_rmse = self._validate()
-                self.logger.info(
-                    f"  [Val @ step {self.global_step}] MAE={val_mae:.4f} TECU  RMSE={val_rmse:.4f} TECU"
-                )
-
-                if val_mae < self.best_val_mae:
-                    self.best_val_mae = val_mae
-                    self.no_improve_count = 0
-                    self._save_checkpoint(epoch, tag="best")
-                    self.logger.info(f"  => 保存最佳模型(MAE={val_mae:.4f})")
-                else:
-                    self.no_improve_count += 1
-                    self.logger.info(f"  => 无改善(连续 {self.no_improve_count}/{self.early_stopping_patience})")
-
-                self.model.train()
+                self._after_optimizer_step(epoch, loss_dict)
 
         # epoch 结束时若有未消耗的累积梯度,也做一次更新
         if n_batches % self.accum_steps != 0:
@@ -383,6 +417,7 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
             self.optimizer.zero_grad()
+            self._after_optimizer_step(epoch, loss_dict)
 
         return total_loss / max(n_batches, 1)
 
@@ -391,7 +426,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _validate(self) -> tuple:
+    def _validate_legacy(self) -> tuple:
         """
         在验证集上评估。
         策略:使用数据集预计算的 context_indices(前 80%)和 target_indices(后 20%),
@@ -512,6 +547,165 @@ class Trainer:
 
         return mae, rmse
 
+    def _metric_summary(self, pred_norm: np.ndarray, target_norm: np.ndarray) -> dict:
+        """Compute metrics in normalized STEC space and original TECU units."""
+        pred_norm = pred_norm.reshape(-1)
+        target_norm = target_norm.reshape(-1)
+
+        diff_norm = pred_norm - target_norm
+        pred_orig = self.stec_normalizer.inverse_transform(pred_norm)
+        target_orig = self.stec_normalizer.inverse_transform(target_norm)
+        diff_orig = pred_orig - target_orig
+
+        return {
+            "mae_norm": float(np.mean(np.abs(diff_norm))),
+            "rmse_norm": float(np.sqrt(np.mean(diff_norm ** 2))),
+            "mae_tecu": float(np.mean(np.abs(diff_orig))),
+            "rmse_tecu": float(np.sqrt(np.mean(diff_orig ** 2))),
+        }
+
+    def _empty_val_metrics(self) -> dict:
+        return {
+            "mae_tecu": float("inf"),
+            "rmse_tecu": float("inf"),
+            "mae_norm": float("inf"),
+            "rmse_norm": float("inf"),
+            "mu_mae_tecu": float("inf"),
+            "mu_rmse_tecu": float("inf"),
+            "mu_mae_norm": float("inf"),
+            "mu_rmse_norm": float("inf"),
+        }
+
+    @torch.no_grad()
+    def _validate(self) -> dict:
+        """
+        Validate one-step denoising and report both normalized-space and TECU metrics.
+
+        The primary early-stopping metric remains MAE in TECU. The extra normalized
+        metrics and mu/IDW baseline metrics are diagnostics for scale and baseline checks.
+        """
+        self.model.eval()
+
+        if self.val_metric_mode == "per_sample":
+            sample_rmse_list = []
+            sample_mae_list = []
+
+        all_pred = []
+        all_target = []
+        all_mu = []
+
+        for batch in self.val_loader:
+            coords = batch["coords"].to(self.device)           # [B, N, 2]
+            angles = batch["angles"].to(self.device)           # [B, N, 2]
+            stec = batch["stec"].to(self.device)               # [B, N, 1]
+            system_ids = batch["system_ids"].to(self.device)   # [B, N]
+            valid_mask = batch["valid_mask"].to(self.device)   # [B, N]
+            context_indices_batch = batch.get("context_indices", None)
+            target_indices_batch = batch.get("target_indices", None)
+
+            B, N, _ = stec.shape
+
+            context_mask, target_mask = generate_context_target_mask(
+                valid_mask.cpu(),
+                mode="val",
+                context_indices_batch=context_indices_batch,
+                target_indices_batch=target_indices_batch,
+            )
+            context_mask = context_mask.to(self.device)
+            target_mask = target_mask.to(self.device)
+
+            if target_mask.sum() == 0:
+                continue
+
+            role_type = torch.zeros(B, N, dtype=torch.long, device=self.device)
+            role_type[context_mask] = 1
+            role_type[target_mask] = 2
+
+            context_stec = stec * context_mask.unsqueeze(-1).float()
+
+            mu, prior_features = self.sde.build_mu_batch(
+                coords, stec, context_mask, target_mask,
+                return_prior_features=True,
+            )
+
+            t_val = self.sde.T // 2
+            t_batch = torch.full((B,), t_val, dtype=torch.long, device=self.device)
+
+            xt_all, noise_all, _ = self.sde.forward_sample_batch(stec, mu, t_batch)
+            noisy_stec = stec.clone()
+            noisy_stec[target_mask] = xt_all[target_mask]
+
+            noise_pred = self.model(
+                noisy_stec=noisy_stec,
+                coords=coords,
+                angles=angles,
+                system_ids=system_ids,
+                context_stec=context_stec,
+                role_type=role_type,
+                valid_mask=valid_mask,
+                t=t_batch,
+                prior_features=prior_features,
+                weak_condition=False,
+            )
+
+            sigma_t = self.sde.sigma_bar(t_val)
+            alpha_t = self.sde.alpha(t_val)
+
+            xt_target = noisy_stec[target_mask]
+            mu_target = mu[target_mask]
+            noise_pred_t = noise_pred[target_mask]
+            x0_pred = (xt_target - mu_target - sigma_t * noise_pred_t) / (alpha_t + 1e-8) + mu_target
+            x0_true = stec[target_mask]
+
+            all_pred.append(x0_pred.cpu())
+            all_target.append(x0_true.cpu())
+            all_mu.append(mu_target.cpu())
+
+            if self.val_metric_mode == "per_sample":
+                for i in range(B):
+                    t_mask_i = target_mask[i]
+                    if t_mask_i.sum() == 0:
+                        continue
+
+                    xt_i = noisy_stec[i, t_mask_i]
+                    mu_i = mu[i, t_mask_i]
+                    eps_i = noise_pred[i, t_mask_i]
+                    x0_pred_i = (xt_i - mu_i - sigma_t * eps_i) / (alpha_t + 1e-8) + mu_i
+                    x0_true_i = stec[i, t_mask_i]
+                    stats_i = self._metric_summary(
+                        x0_pred_i.cpu().numpy().flatten(),
+                        x0_true_i.cpu().numpy().flatten(),
+                    )
+                    sample_rmse_list.append(stats_i["rmse_tecu"])
+                    sample_mae_list.append(stats_i["mae_tecu"])
+
+        if len(all_pred) == 0:
+            self.logger.warning("Validation skipped: no valid target points.")
+            return self._empty_val_metrics()
+
+        all_pred = torch.cat(all_pred, dim=0).numpy()
+        all_target = torch.cat(all_target, dim=0).numpy()
+        all_mu = torch.cat(all_mu, dim=0).numpy()
+
+        metrics = self._metric_summary(all_pred, all_target)
+        mu_metrics = self._metric_summary(all_mu, all_target)
+
+        if self.val_metric_mode == "per_sample":
+            if len(sample_rmse_list) == 0:
+                self.logger.warning("Validation skipped: no valid per-sample target points.")
+                return self._empty_val_metrics()
+            metrics["mae_tecu"] = float(np.mean(sample_mae_list))
+            metrics["rmse_tecu"] = float(np.mean(sample_rmse_list))
+
+        metrics.update({
+            "mu_mae_tecu": mu_metrics["mae_tecu"],
+            "mu_rmse_tecu": mu_metrics["rmse_tecu"],
+            "mu_mae_norm": mu_metrics["mae_norm"],
+            "mu_rmse_norm": mu_metrics["rmse_norm"],
+        })
+
+        return metrics
+
     # ------------------------------------------------------------------
     # Checkpoint 保存与加载
     # ------------------------------------------------------------------
@@ -530,7 +724,7 @@ class Trainer:
         }, ckpt_path)
         self.logger.debug(f"  checkpoint 已保存:{ckpt_path}")
 
-    def load_checkpoint(self, ckpt_path: str):
+    def _load_checkpoint_legacy(self, ckpt_path: str):
         """从 checkpoint 恢复训练状态"""
         assert os.path.exists(ckpt_path), f"checkpoint 不存在:{ckpt_path}"
         ckpt = torch.load(ckpt_path, map_location=self.device)
@@ -542,3 +736,34 @@ class Trainer:
         self.best_val_mae = ckpt.get("best_val_mae", float("inf"))
         self.no_improve_count = ckpt.get("no_improve_count", 0)
         self.logger.info(f"从 {ckpt_path} 恢复训练,下一轮从 epoch {self.start_epoch} 开始")
+
+    def load_checkpoint(
+        self,
+        ckpt_path: str,
+        reset_scheduler: bool = False,
+        reset_global_step: bool = False,
+    ):
+        """Resume training from checkpoint, with optional scheduler/step reset."""
+        assert os.path.exists(ckpt_path), f"checkpoint 不存在:{ckpt_path}"
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+
+        if reset_scheduler:
+            base_lr = self.cfg["training"]["learning_rate"]
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = base_lr
+            self.logger.info("Reset scheduler state; using scheduler initialized from current config.")
+        else:
+            self.scheduler.load_state_dict(ckpt["scheduler_state"])
+
+        self.start_epoch = ckpt["epoch"] + 1
+        self.global_step = 0 if reset_global_step else ckpt.get("global_step", 0)
+        self.best_val_mae = ckpt.get("best_val_mae", float("inf"))
+        self.no_improve_count = ckpt.get("no_improve_count", 0)
+
+        if reset_global_step:
+            self.logger.info("Reset global_step to 0 for the resumed training segment.")
+
+        self.logger.info(f"Resume from {ckpt_path}; next epoch: {self.start_epoch}")

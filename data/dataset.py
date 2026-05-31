@@ -82,6 +82,8 @@ STEC 历元数据集类（多星联合版本）
 """
 
 import os
+import pickle
+import hashlib
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -89,6 +91,23 @@ from torch.utils.data import Dataset
 from typing import List, Optional
 
 from utils.normalizer import CoordNormalizer, STECNormalizer
+
+
+def _compute_cache_key(epoch_files: List[Path], cfg: dict) -> str:
+    """根据文件列表的修改时间和配置参数生成缓存键"""
+    h = hashlib.md5()
+    for f in sorted(epoch_files):
+        stat = os.stat(f)
+        h.update(f"{f}:{stat.st_mtime}:{stat.st_size}".encode())
+    # 纳入影响数据处理的配置项
+    key_cfg = {
+        "split_ratio": cfg.get("split_ratio", 0.8),
+        "min_points": cfg.get("min_points", 50),
+        "seed": cfg.get("seed", 2026),
+        "system_filter": cfg.get("system_filter", None),
+    }
+    h.update(str(sorted(key_cfg.items())).encode())
+    return h.hexdigest()[:16]
 
 
 # ======================================================================
@@ -207,6 +226,7 @@ class STECEpochDataset(Dataset):
         angle_normalizer: Optional[CoordNormalizer] = None,
         seed: int = 2026,
         system_filter: Optional[str] = None,
+        cache_dir: Optional[str] = None,
     ):
         super().__init__()
         assert mode in ("train_context_target", "val_eval", "test_target"), \
@@ -218,7 +238,38 @@ class STECEpochDataset(Dataset):
         self.system_filter = system_filter
         self.system_ascii_code = get_system_ascii_code(system_filter) if system_filter else None
 
+        sys_info = f"（系统过滤: {system_filter}）" if system_filter else "（全系统）"
+
+        # ---------- 尝试从缓存加载 ----------
+        cache_key = _compute_cache_key(epoch_files, {
+            "split_ratio": split_ratio, "min_points": min_points,
+            "seed": seed, "system_filter": system_filter,
+        })
+        cache_file = None
+        if cache_dir is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, f"dataset_{mode}_{cache_key}.pkl")
+
+        if cache_file is not None and os.path.exists(cache_file):
+            print(f"[Dataset-{mode}] {sys_info} 发现缓存，直接加载：{cache_file}")
+            with open(cache_file, "rb") as f:
+                cached = pickle.load(f)
+            self.valid_files = cached["valid_files"]
+            self.coord_normalizer = cached["coord_normalizer"]
+            self.stec_normalizer = cached["stec_normalizer"]
+            self.angle_normalizer = cached["angle_normalizer"]
+            # 若调用方传入了 normalizer，以传入的为准（val 复用 train 的）
+            if coord_normalizer is not None:
+                self.coord_normalizer = coord_normalizer
+            if stec_normalizer is not None:
+                self.stec_normalizer = stec_normalizer
+            if angle_normalizer is not None:
+                self.angle_normalizer = angle_normalizer
+            print(f"[Dataset-{mode}] {sys_info} 缓存加载完成，共 {len(self.valid_files)} 个历元")
+            return
+
         # ---------- 1. 过滤样本：总 IPP 数 < min_points ----------
+        print(f"[Dataset-{mode}] {sys_info} 未找到缓存，从原始 CSV 构建数据集...")
         self.valid_files = []
         for fpath in epoch_files:
             df = pd.read_csv(fpath)
@@ -227,7 +278,6 @@ class STECEpochDataset(Dataset):
             if len(df) >= min_points:
                 self.valid_files.append(fpath)
 
-        sys_info = f"（系统过滤: {system_filter}）" if system_filter else "（全系统）"
         print(f"[Dataset-{mode}] {sys_info} 过滤前：{len(epoch_files)} 个历元文件")
         print(f"[Dataset-{mode}] {sys_info} 过滤后：{len(self.valid_files)} 个历元文件（IPP 数 >= {min_points}）")
 
@@ -269,6 +319,18 @@ class STECEpochDataset(Dataset):
         self.stec_normalizer = stec_normalizer
         self.angle_normalizer = angle_normalizer
 
+        # ---------- 3. 保存缓存（仅保存 train 模式的 normalizer，val 复用） ----------
+        if cache_file is not None:
+            cached = {
+                "valid_files": self.valid_files,
+                "coord_normalizer": self.coord_normalizer,
+                "stec_normalizer": self.stec_normalizer,
+                "angle_normalizer": self.angle_normalizer,
+            }
+            with open(cache_file, "wb") as f:
+                pickle.dump(cached, f)
+            print(f"[Dataset-{mode}] 数据集缓存已保存：{cache_file}")
+
     # ------------------------------------------------------------------
     # Dataset 接口
     # ------------------------------------------------------------------
@@ -289,7 +351,7 @@ class STECEpochDataset(Dataset):
 
         # 确定性打乱（避免文件原始顺序偏置）
         rng = np.random.default_rng(self.seed + idx)
-        perm = rng.permutation(len(df))
+        perm = rng.permutation(len(df))  # 这里的df是单个历元的所有IPP点，打乱这些点的顺序，先打乱再划分，包括后续的训练点池以及验证点池，甚至是后续的target和context
         df = df.iloc[perm].reset_index(drop=True)
 
         # 根据 mode 切分数据
@@ -354,6 +416,7 @@ class STECEpochDataset(Dataset):
 def build_train_val_datasets(
     model_stations_dir: str,
     cfg: dict,
+    cache_dir: Optional[str] = None,
 ) -> tuple:
     """
     构建训练集和验证集，共享归一化参数。
@@ -361,6 +424,7 @@ def build_train_val_datasets(
     Args:
         model_stations_dir: model_stations 目录路径
         cfg: 配置字典（来自 default.yaml 的 data 节）
+        cache_dir: 缓存目录路径，None 则不使用缓存
 
     Returns:
         train_dataset, val_dataset, coord_normalizer, stec_normalizer, angle_normalizer
@@ -383,6 +447,7 @@ def build_train_val_datasets(
         angle_normalizer=None,
         seed=seed,
         system_filter=system_filter,
+        cache_dir=cache_dir,
     )
 
     # 验证集复用训练集的归一化参数
@@ -396,6 +461,7 @@ def build_train_val_datasets(
         angle_normalizer=train_ds.angle_normalizer,
         seed=seed,
         system_filter=system_filter,
+        cache_dir=cache_dir,
     )
 
     return (
