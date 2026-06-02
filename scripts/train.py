@@ -309,6 +309,22 @@ def main():
     print("="*80)
 
     # ------------------------------------------------------------------
+    # 6.5 释放训练占用的 GPU 显存，避免推理阶段显存不足
+    # ------------------------------------------------------------------
+    del trainer
+    del model
+    del sde
+    del train_loader
+    del val_loader
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"[GPU] 训练资源已释放，当前可用显存：{free_gb:.1f} GB")
+
+    # ------------------------------------------------------------------
     # 7. 训练完成后自动运行推理测试
     # ------------------------------------------------------------------
     if not args.no_test:
