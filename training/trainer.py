@@ -381,6 +381,12 @@ class Trainer:
             alpha_t = alpha_t.view(B, 1, 1)
             x0_pred_strong = (noisy_stec - mu - sigma_t * noise_pred_strong) / (alpha_t + 1e-8) + mu
 
+            # 状态域最大似然损失系数（EDiffSR Eq.16-17）：
+            # ||x̂_{t-1} - x*_{t-1}|| = (α_{t-1}/α_t)·σ_t · ||ε̄ - ε||
+            # t-1=0 时 α_0 = exp(0) = 1（解析计算避免索引越界）
+            alpha_prev = torch.exp(-self.sde.theta * (t_batch.float() - 1.0) / self.sde.T).view(B, 1, 1)
+            alpha_prev_coef = (alpha_prev / (alpha_t + 1e-8)) * sigma_t  # [B, 1, 1]
+
             # ---- 8. 计算损失（除以累积步数） ----
             loss_dict = dual_branch_loss(
                 noise_pred_strong=noise_pred_strong,
@@ -390,6 +396,7 @@ class Trainer:
                 x0_true=stec,
                 noisy_stec_weak=noisy_stec_weak,
                 target_mask=target_mask,
+                alpha_prev=alpha_prev_coef,
                 lambda_w=self.lambda_w,
                 lambda_x=self.lambda_x,
                 lambda_j=self.lambda_j,
