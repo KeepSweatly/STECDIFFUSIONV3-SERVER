@@ -245,6 +245,118 @@ class STEC_IRSDE:
         a = self.alpha(t)
         return mu + a * (x0 - mu) # 难道这里没有定义加噪时的均值系数λ吗？
 
+    # ------------------------------------------------------------------
+    # 状态域最大似然损失支撑：反向后验均值（迁移自 EDiffSR reverse_optimum_step）
+    # ------------------------------------------------------------------
+
+    def _sigma_bar_tensor(self, t_float: torch.Tensor) -> torch.Tensor:
+        """
+        解析计算 sigma_bar(t)，支持张量输入且允许 t=0（用于 t-1 时的 σ̄_{t-1}）。
+
+        与 _build_schedule 中的离散调度保持一致：
+          cosine:   max_sigma * (1 - cos(π·t/T)) / 2
+          linear:   max_sigma * t/T
+          constant: max_sigma
+
+        Args:
+            t_float: 任意形状的浮点张量（时间步，可含 0）
+        Returns:
+            sigma_bar: 同形状张量
+        """
+        t_norm = t_float / self.T
+        if self.schedule == "cosine":
+            return self.max_sigma * (1.0 - torch.cos(np.pi * t_norm)) / 2.0
+        elif self.schedule == "linear":
+            return self.max_sigma * t_norm
+        elif self.schedule == "constant":
+            return torch.full_like(t_float, self.max_sigma)
+        else:
+            raise ValueError(f"未知的噪声调度方式：{self.schedule}")
+
+    def posterior_coeffs_batch(self, t_batch: torch.Tensor) -> tuple:
+        """
+        批量计算反向后验 q(x_{t-1} | x_t, x0) 的状态域系数 (c1, c2)：
+
+            x*_{t-1} = μ + c1·(x_t - μ) + c2·(x0 - μ)
+
+        其中（s_t 为单步均值系数，β̃_t² 为单步方差）：
+            s_t   = α_t / α_{t-1}
+            β̃_t² = σ̄_t² - s_t²·σ̄_{t-1}²
+            c1    = s_t · σ̄_{t-1}² / σ̄_t²
+            c2    = α_{t-1} · β̃_t² / σ̄_t²
+
+        t=1 时 σ̄_0=0 → c1=0, c2=1，x*_0 自然退化为 x0（无需特判）。
+
+        Args:
+            t_batch: [B]  时间步（1-indexed，long）
+        Returns:
+            c1, c2: 均为 [B, 1, 1]
+        """
+        t = t_batch.float()
+        a_t    = torch.exp(-self.theta * t / self.T)
+        a_prev = torch.exp(-self.theta * (t - 1.0) / self.T)
+        sig_t    = self._sigma_bar_tensor(t)
+        sig_prev = self._sigma_bar_tensor(t - 1.0)
+
+        s_t   = a_t / (a_prev + self.eps)
+        beta2 = (sig_t ** 2 - s_t ** 2 * sig_prev ** 2).clamp(min=0.0)
+        # σ̄_t² 在 t≥1 恒 >0（cosine 调度下 t=1 时约 2.4e-7），用极小 floor 防除零，
+        # 避免 self.eps(1e-8) 在小 t 处显著扭曲系数（否则 t=1 时 c2≈0.96 而非 1.0）
+        denom = sig_t ** 2 + 1e-12
+
+        c1 = s_t * sig_prev ** 2 / denom
+        c2 = a_prev * beta2 / denom
+        return c1.view(-1, 1, 1), c2.view(-1, 1, 1)
+
+    def predict_x0_from_noise(
+        self,
+        xt: torch.Tensor,
+        noise_pred: torch.Tensor,
+        mu: torch.Tensor,
+        t_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        从加噪样本 xt 和预测噪声恢复 x0 估计（批量）：
+            x0_pred = (xt - μ - σ̄_t·ε̄) / α_t + μ
+
+        Args:
+            xt:         [B, N, 1]  加噪样本
+            noise_pred: [B, N, 1]  预测噪声 ε̄
+            mu:         [B, N, 1]  条件均值
+            t_batch:    [B]        时间步（1-indexed）
+        Returns:
+            x0_pred: [B, N, 1]
+        """
+        t = t_batch.float()
+        a_t   = torch.exp(-self.theta * t / self.T).view(-1, 1, 1)
+        sig_t = self._sigma_bar_tensor(t).view(-1, 1, 1)
+        return (xt - mu - sig_t * noise_pred) / (a_t + self.eps) + mu
+
+    def reverse_posterior_mean(
+        self,
+        xt: torch.Tensor,
+        x0: torch.Tensor,
+        mu: torch.Tensor,
+        t_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        反向后验均值（批量，状态域），EDiffSR reverse_optimum_step 的项目 SDE 适配版：
+            x_{t-1} = μ + c1·(xt - μ) + c2·(x0 - μ)
+
+        - 传入真实 x0 → 得到理论最优状态 x*_{t-1}
+        - 传入 x0_pred → 得到预测反向状态 x̂_{t-1}
+
+        Args:
+            xt:      [B, N, 1]  加噪样本
+            x0:      [B, N, 1]  x0（真实或预测）
+            mu:      [B, N, 1]  条件均值
+            t_batch: [B]        时间步（1-indexed）
+        Returns:
+            x_{t-1}: [B, N, 1]
+        """
+        c1, c2 = self.posterior_coeffs_batch(t_batch)
+        return mu + c1 * (xt - mu) + c2 * (x0 - mu)
+
     def guidance_timestep_schedule(self, t: int) -> float:
         """
         时步自适应 guidance 调度函数（第四阶段）。

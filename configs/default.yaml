@@ -58,6 +58,9 @@ mu_reg:
   lambda_w: 0.5                              # 弱条件损失权重
   lambda_x: 0.2                              # x0 重建损失权重
   lambda_j: 1.0e-4                           # Jacobian 稳定项权重
+  lambda_smooth: 1.0e-3                      # 空间平滑/物理正则权重（弱正则，抑制 STEC 空间抖动）
+  smooth_k: 8                                # 空间平滑：每个 target 点取最近 k 个邻居
+  smooth_use_context: true                   # 空间平滑：邻居是否包含 context 真实观测锚点
 
   # Guidance 参数（第三、四阶段启用）
   guidance_scale_max: 2.0                    # 最大 guidance 强度
@@ -73,7 +76,7 @@ mu_reg:
 # ---- 模型配置 ----
 model:
   dim: 512                                   # Transformer 隐层维度
-  depth: 3                                   # Transformer 层数
+  depth: 4                                   # Transformer 层数
   heads: 8                                   # 注意力头数
   mlp_ratio: 4.0                             # FFN 扩展比例
   dropout: 0.0
@@ -93,10 +96,10 @@ model:
 
 # ---- 训练配置 ----
 training:
-  batch_size: 4                                # Flash/Efficient Attention 节省显存，可用更大 batch
+  batch_size: 32                                # Flash/Efficient Attention 节省显存，可用更大 batch
   gradient_accumulation_steps: 1               # 梯度累积步数（等效 batch_size = 4×8 = 32）
-  num_epochs: 1800
-  learning_rate: 1.0e-4                        # 从头训练时的初始学习率
+  num_epochs: 500
+  learning_rate: 1.0e-5                        # 从头训练时的初始学习率
   resume_lr: null                              # resume 时覆盖学习率；null 则沿用 learning_rate（不纳入命名）
   weight_decay: 1.0e-4
   grad_clip: 1.0                             # 梯度裁剪范数

@@ -243,6 +243,7 @@ def main():
         f"_ik{_inf['idw_k']}_ip{_inf['idw_power']}"
         f"_mmi{_dat['mask_ratio_min']}_mma{_dat['mask_ratio_max']}"
         f"_wcd{_mu.get('weak_context_dropout', 0.3)}"
+        f"_las{_mu.get('lambda_smooth', 1e-3)}"
     )
 
     out_dir = cfg["experiment"]["output_dir"]

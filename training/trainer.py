@@ -152,6 +152,9 @@ class Trainer:
         self.lambda_w = mu_reg_cfg.get("lambda_w", 0.5)
         self.lambda_x = mu_reg_cfg.get("lambda_x", 0.2)
         self.lambda_j = mu_reg_cfg.get("lambda_j", 1e-4)
+        self.lambda_smooth = mu_reg_cfg.get("lambda_smooth", 1e-3)
+        self.smooth_k = mu_reg_cfg.get("smooth_k", 8)
+        self.smooth_use_context = mu_reg_cfg.get("smooth_use_context", True)
         self.weak_context_dropout = mu_reg_cfg.get("weak_context_dropout", 0.3)
 
         # 输出目录
@@ -209,7 +212,8 @@ class Trainer:
                 f"L_strong={loss_dict['loss_strong'].item():.6f} "
                 f"L_weak={loss_dict['loss_weak'].item():.6f} "
                 f"L_x0={loss_dict['loss_x0'].item():.6f} "
-                f"L_jac={loss_dict['loss_jac'].item():.6f}"
+                f"L_jac={loss_dict['loss_jac'].item():.6f} "
+                f"L_smooth={loss_dict['loss_smooth'].item():.6f}"
             )
 
         if self.global_step >= self.val_start_step and self.global_step % self.val_interval == 0:
@@ -380,12 +384,17 @@ class Trainer:
             sigma_t = sigma_t.view(B, 1, 1)
             alpha_t = alpha_t.view(B, 1, 1)
             x0_pred_strong = (noisy_stec - mu - sigma_t * noise_pred_strong) / (alpha_t + 1e-8) + mu
+            x0_pred_weak   = (noisy_stec - mu - sigma_t * noise_pred_weak) / (alpha_t + 1e-8) + mu
 
-            # 状态域最大似然损失系数（EDiffSR Eq.16-17）：
-            # ||x̂_{t-1} - x*_{t-1}|| = (α_{t-1}/α_t)·σ_t · ||ε̄ - ε||
-            # t-1=0 时 α_0 = exp(0) = 1（解析计算避免索引越界）
-            alpha_prev = torch.exp(-self.sde.theta * (t_batch.float() - 1.0) / self.sde.T).view(B, 1, 1)
-            alpha_prev_coef = (alpha_prev / (alpha_t + 1e-8)) * sigma_t  # [B, 1, 1]
+            # 状态域最大似然损失（EDiffSR Eq.16-17，denoising_model.optimize_parameters）：
+            #   x*_{t-1} = 反向后验均值(xt, x0_true)        理论最优状态
+            #   x̂_{t-1} = 反向后验均值(xt, x0_pred)         预测反向状态
+            #   loss = L(x̂_{t-1}, x*_{t-1})
+            # 后验均值 = μ + c1·(xt-μ) + c2·(x0-μ)，c1 非零（依赖 xt），
+            # 不再退化为常数加权的噪声残差。
+            xt_1_optimum     = self.sde.reverse_posterior_mean(noisy_stec, stec, mu, t_batch)
+            xt_1_pred_strong = self.sde.reverse_posterior_mean(noisy_stec, x0_pred_strong, mu, t_batch)
+            xt_1_pred_weak   = self.sde.reverse_posterior_mean(noisy_stec, x0_pred_weak, mu, t_batch)
 
             # ---- 8. 计算损失（除以累积步数） ----
             loss_dict = dual_branch_loss(
@@ -396,10 +405,17 @@ class Trainer:
                 x0_true=stec,
                 noisy_stec_weak=noisy_stec_weak,
                 target_mask=target_mask,
-                alpha_prev=alpha_prev_coef,
+                xt_1_optimum=xt_1_optimum,
+                xt_1_pred_strong=xt_1_pred_strong,
+                xt_1_pred_weak=xt_1_pred_weak,
+                coords=coords,
+                context_mask=context_mask,
                 lambda_w=self.lambda_w,
                 lambda_x=self.lambda_x,
                 lambda_j=self.lambda_j,
+                lambda_smooth=self.lambda_smooth,
+                smooth_k=self.smooth_k,
+                smooth_use_context=self.smooth_use_context,
                 loss_type=self.loss_type,
             )
             loss = loss_dict["loss_total"] / self.accum_steps
