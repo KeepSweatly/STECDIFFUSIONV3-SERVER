@@ -35,8 +35,8 @@ FIG_DIR = os.path.join(SCRIPT_DIR, "figures")               # plots/figures
 DEFAULT_CSV = os.path.join(
     PROJECT_ROOT,
     "results",
-    "Test_chp_joint_BDS_d1024_L4_h8_mr4.0_sig2.0_g2.0_lr0.0001_"
-    "bs32_ik20_ip2.0_mmi0.1_mma0.3_wcd0.2",
+    "Test_chp_joint_BDS_d512_L4_h8_mr4.0_sig2.0_g2.0_lr0.0001"
+    "_bs32_ik20_ip2.0_mmi0.1_mma0.3_wcd0.2_las0.001",
     "all_predictions.csv",
 )
 

@@ -28,6 +28,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MultipleLocator
 
 
 # ----------------------------------------------------------------------
@@ -44,6 +45,17 @@ DATASET_ROOT = os.path.join(
 )  # D:/Phd/IonoModeling/dataset
 DEFAULT_MODEL_DIR = os.path.join(DATASET_ROOT, "model_stations_demo_IPP")
 DEFAULT_VAL_DIR = os.path.join(DATASET_ROOT, "val_stations_demo_IPP")
+
+# GNSS 系统名 -> CSV 中 system_id (系统首字母的 ASCII 码)
+# 与 data/dataset.py 的 SYSTEM_NAME_TO_ASCII 保持一致
+SYSTEM_NAME_TO_ID = {
+    "GPS": 71,       # 'G'
+    "GLONASS": 82,   # 'R'
+    "Galileo": 69,   # 'E'
+    "BDS": 67,       # 'C' 北斗
+    "QZSS": 74,      # 'J'
+    "IRNSS": 73,     # 'I'
+}
 
 
 def parse_args():
@@ -71,8 +83,35 @@ def parse_args():
         default=None,
         help="输出图片路径。默认存到 plots/figures/ 下, 文件名含历元。",
     )
+    p.add_argument(
+        "--system",
+        default="BDS",
+        help="只绘制指定 GNSS 系统的 IPP 点, 可选 "
+        f"{'/'.join(SYSTEM_NAME_TO_ID)} 或 all (全部)。默认 BDS。",
+    )
     p.add_argument("--dpi", type=int, default=300, help="输出图片 DPI")
     return p.parse_args()
+
+
+def filter_by_system(df, system, which):
+    """按 GNSS 系统过滤 (system='all' 时不过滤)。which 仅用于打印。"""
+    if system.lower() == "all":
+        return df
+    if "system_id" not in df.columns:
+        raise ValueError(
+            f"{which} 数据缺少 system_id 列, 无法按系统过滤。"
+            " 可用 --system all 绘制全部。"
+        )
+    if system not in SYSTEM_NAME_TO_ID:
+        raise ValueError(
+            f"未知系统 '{system}', 可选: "
+            f"{', '.join(SYSTEM_NAME_TO_ID)} 或 all"
+        )
+    sys_id = SYSTEM_NAME_TO_ID[system]
+    sub = df[df["system_id"] == sys_id]
+    print(f"  [{which}] 系统 {system}(id={sys_id}): "
+          f"{len(sub)}/{len(df)} 点")
+    return sub.reset_index(drop=True)
 
 
 def epoch_to_filename(epoch_raw):
@@ -135,7 +174,18 @@ def main():
             raise ValueError(f"{name} 数据缺少列: {sorted(miss)}")
 
     print(f"[info] 历元 {epoch_label}: context {len(model_df)} 点, "
-          f"target {len(val_df)} 点")
+          f"target {len(val_df)} 点 (过滤前)")
+
+    # 按 GNSS 系统过滤 (默认 BDS)
+    model_df = filter_by_system(model_df, args.system, "context")
+    val_df = filter_by_system(val_df, args.system, "target")
+    sys_label = args.system.upper() if args.system.lower() == "all" \
+        else args.system
+
+    if len(model_df) == 0 and len(val_df) == 0:
+        raise ValueError(
+            f"系统 {args.system} 在该历元下没有任何 IPP 点, 请换系统或历元。"
+        )
 
     # 两类点共用同一 STEC 色标范围
     combined = pd.concat([model_df["stec"], val_df["stec"]],
@@ -182,10 +232,14 @@ def main():
     ax.set_xlabel("IPP Longitude (deg)", fontsize=12)
     ax.set_ylabel("IPP Latitude (deg)", fontsize=12)
     ax.set_title(
-        f"IPP STEC: Context vs Target  @ {epoch_label}",
+        f"IPP STEC: Context vs Target  @ {epoch_label}  [{sys_label}]",
         fontsize=14, fontweight="bold",
     )
     ax.grid(True, linestyle="--", alpha=0.4)
+    # 横轴 (longitude) tick 间隔 2.5 度, 纵轴 (latitude) tick 间隔 5 度
+    # 配合虚线网格, 可按 tick 网格定位 target 点
+    ax.xaxis.set_major_locator(MultipleLocator(2.5))
+    ax.yaxis.set_major_locator(MultipleLocator(5))
     ax.tick_params(labelsize=9)
 
     fig.tight_layout()
@@ -195,7 +249,8 @@ def main():
     else:
         os.makedirs(FIG_DIR, exist_ok=True)
         out_path = os.path.join(
-            FIG_DIR, f"ipp_context_target_{epoch_label}.png"
+            FIG_DIR,
+            f"ipp_context_target_{epoch_label}_{sys_label}.png",
         )
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)

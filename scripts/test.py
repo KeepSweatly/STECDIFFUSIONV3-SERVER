@@ -344,6 +344,114 @@ def predict_batch(
     return result_dfs
 
 
+def compute_and_export_metrics(final_results, result_dir, valid_epochs_count,
+                               export_all=True, prefix=""):
+    """
+    计算并导出评估指标（direct 与 product 共用）。
+
+    prefix="" 时为原 direct 流程，文件名/指标含义完全不变（向后兼容）；
+    prefix="product_" 时所有输出文件加 product_ 前缀，便于与 direct 对比。
+
+    direct 与 product 唯一区别在于 final_results["pred_stec"] 的来源：
+      - direct ：模型直接预测 val IPP；
+      - product：格网角点 IDW 插值。
+    label、误差列与全部指标口径完全一致。
+
+    Args:
+        final_results:      DataFrame，含 abs_error/system_id/satellite_id/
+                            station_name/epoch_time 等列
+        result_dir:         结果输出目录
+        valid_epochs_count: 历元数（写入 metrics json）
+        export_all:         是否导出完整预测 CSV（product 模式建议 False）
+        prefix:             文件名前缀（"" 或 "product_"）
+    Returns:
+        metrics: dict
+    """
+    # 完整预测结果（product 模式默认不导出大文件）
+    if export_all:
+        all_pred_path = os.path.join(result_dir, f"{prefix}all_predictions.csv")
+        final_results.to_csv(all_pred_path, index=False)
+        print(f"  完整预测结果：{all_pred_path}（{len(final_results)} 条记录）")
+
+    # 整体指标（全局模式）
+    mae_all  = float(final_results["abs_error"].mean())
+    rmse_all = float(np.sqrt((final_results["abs_error"] ** 2).mean()))
+    print(f"\n  整体指标（全局模式，汇总全部 target 点）：")
+    print(f"    总 target 点数：{len(final_results)}")
+    print(f"    MAE  = {mae_all:.4f} TECU")
+    print(f"    RMSE = {rmse_all:.4f} TECU")
+
+    # per-epoch
+    epoch_metric_rows = []
+    for epoch_stem, grp in final_results.groupby("epoch_time"):
+        epoch_metric_rows.append({
+            "epoch_time": epoch_stem,
+            "n_target_points": len(grp),
+            "mae_tecu": float(grp["abs_error"].mean()),
+            "rmse_tecu": float(np.sqrt((grp["abs_error"] ** 2).mean())),
+        })
+    epoch_metric_df = pd.DataFrame(epoch_metric_rows)
+    epoch_metric_df.to_csv(os.path.join(result_dir, f"{prefix}rmse_per_epoch.csv"), index=False)
+    avg_sample_mae  = float(epoch_metric_df["mae_tecu"].mean())
+    avg_sample_rmse = float(epoch_metric_df["rmse_tecu"].mean())
+    print(f"    Per-sample 平均 MAE  = {avg_sample_mae:.4f} TECU")
+    print(f"    Per-sample 平均 RMSE = {avg_sample_rmse:.4f} TECU")
+
+    # by satellite
+    summary_rows = []
+    for (sys_id, sat_id), grp in final_results.groupby(["system_id", "satellite_id"]):
+        summary_rows.append({
+            "system_id": sys_id, "satellite_id": sat_id, "n_points": len(grp),
+            "mae_tecu": float(grp["abs_error"].mean()),
+            "rmse_tecu": float(np.sqrt((grp["abs_error"] ** 2).mean())),
+        })
+    pd.DataFrame(summary_rows).to_csv(
+        os.path.join(result_dir, f"{prefix}summary_by_satellite.csv"), index=False)
+
+    # by station
+    station_rows = []
+    for station, grp in final_results.groupby("station_name"):
+        station_rows.append({
+            "station_name": station, "n_points": len(grp),
+            "mae_tecu": float(grp["abs_error"].mean()),
+            "rmse_tecu": float(np.sqrt((grp["abs_error"] ** 2).mean())),
+        })
+    pd.DataFrame(station_rows).to_csv(
+        os.path.join(result_dir, f"{prefix}summary_by_station.csv"), index=False)
+
+    # by 30min timeslot
+    def stem_to_datetime(stem: str) -> datetime:
+        return datetime.strptime(stem.split("-")[0], "%Y%m%d_%H%M%S")
+
+    fr = final_results.copy()
+    fr["datetime"] = fr["epoch_time"].apply(stem_to_datetime)
+    fr["time_slot"] = fr["datetime"].apply(
+        lambda dt: dt.replace(minute=(dt.minute // 30) * 30, second=0).strftime("%Y%m%d_%H%M"))
+    slot_rows = []
+    for slot, grp in fr.groupby("time_slot"):
+        slot_rows.append({
+            "time_slot": slot, "n_points": len(grp),
+            "mae_tecu": float(grp["abs_error"].mean()),
+            "rmse_tecu": float(np.sqrt((grp["abs_error"] ** 2).mean())),
+        })
+    pd.DataFrame(slot_rows).to_csv(
+        os.path.join(result_dir, f"{prefix}summary_by_timeslot_30min.csv"), index=False)
+
+    # 整体指标 JSON
+    metrics = {
+        "n_epochs":            valid_epochs_count,
+        "n_target_points":     len(final_results),
+        "global_mae_tecu":     mae_all,
+        "global_rmse_tecu":    rmse_all,
+        "per_sample_mae_tecu": avg_sample_mae,
+        "per_sample_rmse_tecu": avg_sample_rmse,
+    }
+    with open(os.path.join(result_dir, f"{prefix}metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    print(f"  指标 JSON：{os.path.join(result_dir, f'{prefix}metrics.json')}")
+    return metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="STEC 条件扩散模型测试脚本（多星联合版）")
     parser.add_argument(
@@ -359,6 +467,12 @@ def main():
     parser.add_argument(
         "--verbose", action="store_true",
         help="是否打印反向扩散进度"
+    )
+    parser.add_argument(
+        "--eval-mode", type=str, default=None,
+        choices=["direct", "product", "both"],
+        help="评估模式：direct(原始直接推理) / product(格网产品IDW) / both；"
+             "不指定则用配置 inference.eval_mode（默认 direct）"
     )
     args = parser.parse_args()
 
@@ -533,219 +647,145 @@ def main():
     # ------------------------------------------------------------------
     # 4. 推理预测（批量并行）
     # ------------------------------------------------------------------
-    # 自动估算 batch size
-    infer_batch_size = estimate_infer_batch_size(
-        valid_epochs=valid_epochs,
-        model_files=model_files,
-        val_files=val_files,
-        system_ascii_code=system_ascii_code,
-        device=device,
-        model_n_params=sum(p.numel() for p in model.parameters()),
-        model_dim=cfg["model"].get("dim", 256),
-        model_depth=cfg["model"].get("depth", 3),
-    )
+    # 评估模式：CLI 优先，否则用配置 inference.eval_mode（默认 direct）
+    eval_mode = args.eval_mode or cfg["inference"].get("eval_mode", "direct")
+    run_direct  = eval_mode in ("direct", "both")
+    run_product = eval_mode in ("product", "both")
+    print(f"\n[EvalMode] {eval_mode}  (direct={run_direct}, product={run_product})")
 
-    n_epochs = len(valid_epochs)
-    n_batches = (n_epochs + infer_batch_size - 1) // infer_batch_size
-    print(f"\n[4/5] 推理预测（共 {n_epochs} 个历元，batch_size={infer_batch_size}，共 {n_batches} 个 batch）...")
-    all_results = []
-    n_done = 0
-
-    for batch_idx in range(n_batches):
-        batch_stems = valid_epochs[batch_idx * infer_batch_size : (batch_idx + 1) * infer_batch_size]
-
-        # 读取并提取每个历元的数组
-        epoch_data_list = []
-        stem_list = []
-        for stem in batch_stems:
-            model_df_i = pd.read_csv(model_files[stem])
-            val_df_i   = pd.read_csv(val_files[stem])
-            try:
-                data = _extract_epoch_arrays(model_df_i, val_df_i, system_ascii_code)
-                epoch_data_list.append(data)
-                stem_list.append(stem)
-            except Exception as e:
-                print(f"    [Warning] 历元 {stem} 数据提取失败：{e}")
-
-        if not epoch_data_list:
-            continue
-
-        try:
-            batch_tensors, meta_list = collate_inference_batch(
-                epoch_data_list, coord_norm, stec_norm, angle_norm, device
-            )
-            result_dfs = predict_batch(
-                model=model,
-                sde=sde,
-                batch_tensors=batch_tensors,
-                meta_list=meta_list,
-                stec_norm=stec_norm,
-                device=device,
-                verbose=args.verbose,
-            )
-            for stem, rdf in zip(stem_list, result_dfs):
-                rdf["epoch_time"] = stem
-                all_results.append(rdf)
-        except Exception as e:
-            print(f"    [Warning] batch {batch_idx+1}/{n_batches} 推理失败：{e}，逐历元回退...")
-            for stem, data in zip(stem_list, epoch_data_list):
-                try:
-                    bt, ml = collate_inference_batch([data], coord_norm, stec_norm, angle_norm, device)
-                    rdfs = predict_batch(model, sde, bt, ml, stec_norm, device, args.verbose)
-                    rdfs[0]["epoch_time"] = stem
-                    all_results.append(rdfs[0])
-                except Exception as e2:
-                    print(f"    [Warning] 历元 {stem} 推理失败：{e2}")
-
-        n_done += len(stem_list)
-        print(f"  [{batch_idx+1}/{n_batches}] 已完成 {n_done}/{n_epochs} 个历元")
-
-    if not all_results:
-        print("[Error] 所有历元推理均失败")
-        return
-
-    final_results = pd.concat(all_results, ignore_index=True)
-
-    # ------------------------------------------------------------------
-    # 5. 导出结果
-    # ------------------------------------------------------------------
-    print(f"\n[5/5] 导出结果...")
+    # 结果目录（direct 与 product 共用，product 文件加 product_ 前缀）
     result_base = cfg["inference"].get("result_output_dir", "results/final_test")
-    result_base_dir = os.path.dirname(result_base)  # "results"
+    result_base_dir = os.path.dirname(result_base)
     result_dir = os.path.join(project_root, result_base_dir, f"Test_{setting_tag}")
     os.makedirs(result_dir, exist_ok=True)
 
-    # 导出完整结果（所有卫星，所有历元）
-    if cfg["inference"].get("export_all_predictions", True):
-        all_pred_path = os.path.join(result_dir, "all_predictions.csv")
-        final_results.to_csv(all_pred_path, index=False)
-        print(f"  完整预测结果：{all_pred_path}（{len(final_results)} 条记录）")
+    # ==================================================================
+    # 4A. direct 评估（原始：模型直接预测 val IPP 点）
+    # ==================================================================
+    if run_direct:
+        # 自动估算 batch size
+        infer_batch_size = estimate_infer_batch_size(
+            valid_epochs=valid_epochs,
+            model_files=model_files,
+            val_files=val_files,
+            system_ascii_code=system_ascii_code,
+            device=device,
+            model_n_params=sum(p.numel() for p in model.parameters()),
+            model_dim=cfg["model"].get("dim", 256),
+            model_depth=cfg["model"].get("depth", 3),
+        )
 
-    # 整体指标（全局模式：汇总所有 target 点）
-    mae_all  = float(final_results["abs_error"].mean())
-    rmse_all = float(np.sqrt((final_results["abs_error"] ** 2).mean()))
-    print(f"\n  整体指标（全局模式，汇总全部 target 点）：")
-    print(f"    总 target 点数：{len(final_results)}")
-    print(f"    MAE  = {mae_all:.4f} TECU")
-    print(f"    RMSE = {rmse_all:.4f} TECU")
+        n_epochs = len(valid_epochs)
+        n_batches = (n_epochs + infer_batch_size - 1) // infer_batch_size
+        print(f"\n[direct 4/5] 推理预测（共 {n_epochs} 个历元，batch_size={infer_batch_size}，"
+              f"共 {n_batches} 个 batch）...")
+        all_results = []
+        n_done = 0
 
-    # 按历元（样本）计算 per-sample RMSE/MAE，并导出 CSV
-    print(f"\n  按历元分析指标：")
-    epoch_metric_rows = []
-    for epoch_stem, grp in final_results.groupby("epoch_time"):
-        ep_mae  = float(grp["abs_error"].mean())
-        ep_rmse = float(np.sqrt((grp["abs_error"] ** 2).mean()))
-        n_pts   = len(grp)
-        epoch_metric_rows.append({
-            "epoch_time": epoch_stem,
-            "n_target_points": n_pts,
-            "mae_tecu": ep_mae,
-            "rmse_tecu": ep_rmse,
-        })
+        for batch_idx in range(n_batches):
+            batch_stems = valid_epochs[batch_idx * infer_batch_size : (batch_idx + 1) * infer_batch_size]
 
-    epoch_metric_df = pd.DataFrame(epoch_metric_rows)
-    epoch_metric_path = os.path.join(result_dir, "rmse_per_epoch.csv")
-    epoch_metric_df.to_csv(epoch_metric_path, index=False)
+            # 读取并提取每个历元的数组
+            epoch_data_list = []
+            stem_list = []
+            for stem in batch_stems:
+                model_df_i = pd.read_csv(model_files[stem])
+                val_df_i   = pd.read_csv(val_files[stem])
+                try:
+                    data = _extract_epoch_arrays(model_df_i, val_df_i, system_ascii_code)
+                    epoch_data_list.append(data)
+                    stem_list.append(stem)
+                except Exception as e:
+                    print(f"    [Warning] 历元 {stem} 数据提取失败：{e}")
 
-    avg_sample_mae  = float(epoch_metric_df["mae_tecu"].mean())
-    avg_sample_rmse = float(epoch_metric_df["rmse_tecu"].mean())
-    print(f"    Per-sample 平均 MAE  = {avg_sample_mae:.4f} TECU")
-    print(f"    Per-sample 平均 RMSE = {avg_sample_rmse:.4f} TECU")
-    print(f"    Per-sample 指标 CSV：{epoch_metric_path}（{len(epoch_metric_df)} 个历元）")
+            if not epoch_data_list:
+                continue
 
-    # 按 satellite_id + system_id 分组统计
-    print(f"\n  按卫星分组指标：")
-    summary_rows = []
-    for (sys_id, sat_id), grp in final_results.groupby(["system_id", "satellite_id"]):
-        mae_i  = float(grp["abs_error"].mean())
-        rmse_i = float(np.sqrt((grp["abs_error"] ** 2).mean()))
-        n_pts  = len(grp)
-        print(f"    system_id={sys_id} satellite_id={sat_id:3d}: "
-              f"MAE={mae_i:.4f}  RMSE={rmse_i:.4f}  N={n_pts}")
-        summary_rows.append({
-            "system_id":    sys_id,
-            "satellite_id": sat_id,
-            "n_points":     n_pts,
-            "mae_tecu":     mae_i,
-            "rmse_tecu":    rmse_i,
-        })
+            try:
+                batch_tensors, meta_list = collate_inference_batch(
+                    epoch_data_list, coord_norm, stec_norm, angle_norm, device
+                )
+                result_dfs = predict_batch(
+                    model=model,
+                    sde=sde,
+                    batch_tensors=batch_tensors,
+                    meta_list=meta_list,
+                    stec_norm=stec_norm,
+                    device=device,
+                    verbose=args.verbose,
+                )
+                for stem, rdf in zip(stem_list, result_dfs):
+                    rdf["epoch_time"] = stem
+                    all_results.append(rdf)
+            except Exception as e:
+                print(f"    [Warning] batch {batch_idx+1}/{n_batches} 推理失败：{e}，逐历元回退...")
+                for stem, data in zip(stem_list, epoch_data_list):
+                    try:
+                        bt, ml = collate_inference_batch([data], coord_norm, stec_norm, angle_norm, device)
+                        rdfs = predict_batch(model, sde, bt, ml, stec_norm, device, args.verbose)
+                        rdfs[0]["epoch_time"] = stem
+                        all_results.append(rdfs[0])
+                    except Exception as e2:
+                        print(f"    [Warning] 历元 {stem} 推理失败：{e2}")
 
-    # 导出分组统计摘要
-    summary_df = pd.DataFrame(summary_rows)
-    summary_path = os.path.join(result_dir, "summary_by_satellite.csv")
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n  分组统计摘要：{summary_path}")
+            n_done += len(stem_list)
+            print(f"  [{batch_idx+1}/{n_batches}] 已完成 {n_done}/{n_epochs} 个历元")
 
-    # ------------------------------------------------------------------
-    # 按测站统计 IPP 建模精度
-    # ------------------------------------------------------------------
-    print(f"\n  按测站统计指标：")
-    station_rows = []
-    for station, grp in final_results.groupby("station_name"):
-        mae_s  = float(grp["abs_error"].mean())
-        rmse_s = float(np.sqrt((grp["abs_error"] ** 2).mean()))
-        n_pts  = len(grp)
-        print(f"    {station}: MAE={mae_s:.4f}  RMSE={rmse_s:.4f}  N={n_pts}")
-        station_rows.append({
-            "station_name": station,
-            "n_points":     n_pts,
-            "mae_tecu":     mae_s,
-            "rmse_tecu":    rmse_s,
-        })
+        if not all_results:
+            print("[Error] direct 模式所有历元推理均失败")
+        else:
+            final_results = pd.concat(all_results, ignore_index=True)
+            print(f"\n[direct 5/5] 导出结果...")
+            compute_and_export_metrics(
+                final_results, result_dir, len(valid_epochs),
+                export_all=cfg["inference"].get("export_all_predictions", True),
+                prefix="",
+            )
 
-    station_df = pd.DataFrame(station_rows)
-    station_path = os.path.join(result_dir, "summary_by_station.csv")
-    station_df.to_csv(station_path, index=False)
-    print(f"  测站统计摘要：{station_path}")
+    # ==================================================================
+    # 4B. product 评估（格网产品播发 + 用户端 16 角点 IDW 插值）
+    # ==================================================================
+    if run_product:
+        # 延迟导入，避免 product_eval 顶层 import scripts.test 造成循环导入
+        from inference.product_eval import run_product_evaluation
 
-    # ------------------------------------------------------------------
-    # 按 30 分钟时段统计 IPP 建模精度
-    # ------------------------------------------------------------------
-    print(f"\n  按 30 分钟时段统计指标：")
+        product_cfg = cfg["inference"].get("product_eval", {}) or {}
+        print(f"\n[product] 格网产品评估启动...")
+        product_df, product_stats = run_product_evaluation(
+            model=model,
+            sde=sde,
+            valid_epochs=valid_epochs,
+            model_files=model_files,
+            val_files=val_files,
+            system_ascii_code=system_ascii_code,
+            product_cfg=product_cfg,
+            coord_norm=coord_norm,
+            stec_norm=stec_norm,
+            angle_norm=angle_norm,
+            device=device,
+            verbose=args.verbose,
+        )
 
-    def stem_to_datetime(stem: str) -> datetime:
-        ts = stem.split("-")[0]  # "20240218_000000"
-        return datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        if product_df is None or len(product_df) == 0:
+            print("[Warning] product 模式无有效 val 点（可能全部越界），跳过指标导出")
+        else:
+            # 轻量级 val 级结果（非完整格网产品）
+            product_val_path = os.path.join(result_dir, "product_val_results.csv")
+            product_df.to_csv(product_val_path, index=False)
+            print(f"  product val 级结果：{product_val_path}（{len(product_df)} 条）")
 
-    final_results["datetime"] = final_results["epoch_time"].apply(stem_to_datetime)
-    final_results["time_slot"] = final_results["datetime"].apply(
-        lambda dt: dt.replace(minute=(dt.minute // 30) * 30, second=0).strftime("%Y%m%d_%H%M")
-    )
+            # 指标导出（product_ 前缀；不导出 all_predictions 大文件）
+            print(f"\n[product] 导出指标...")
+            compute_and_export_metrics(
+                product_df, result_dir, len(valid_epochs),
+                export_all=False, prefix="product_",
+            )
 
-    slot_rows = []
-    for slot, grp in final_results.groupby("time_slot"):
-        mae_t  = float(grp["abs_error"].mean())
-        rmse_t = float(np.sqrt((grp["abs_error"] ** 2).mean()))
-        n_pts  = len(grp)
-        print(f"    {slot}: MAE={mae_t:.4f}  RMSE={rmse_t:.4f}  N={n_pts}")
-        slot_rows.append({
-            "time_slot":  slot,
-            "n_points":   n_pts,
-            "mae_tecu":   mae_t,
-            "rmse_tecu":  rmse_t,
-        })
-
-    slot_df = pd.DataFrame(slot_rows)
-    slot_path = os.path.join(result_dir, "summary_by_timeslot_30min.csv")
-    slot_df.to_csv(slot_path, index=False)
-    print(f"  时段统计摘要：{slot_path}")
-
-    # 清理临时列
-    final_results.drop(columns=["datetime", "time_slot"], inplace=True)
-
-    # 导出整体指标 JSON
-    metrics = {
-        "n_epochs":            len(valid_epochs),
-        "n_target_points":     len(final_results),
-        "global_mae_tecu":     mae_all,
-        "global_rmse_tecu":    rmse_all,
-        "per_sample_mae_tecu": avg_sample_mae,
-        "per_sample_rmse_tecu": avg_sample_rmse,
-    }
-    metrics_path = os.path.join(result_dir, "metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-    print(f"  整体指标 JSON：{metrics_path}")
+        # 格网与统计摘要（内存友好：仅汇总量，不存完整格网）
+        summary_path = os.path.join(result_dir, "product_test_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(product_stats, f, indent=2, ensure_ascii=False)
+        print(f"  product 统计摘要：{summary_path}")
 
     print("\n" + "="*80)
     print("测试完成！")
