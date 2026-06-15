@@ -266,84 +266,92 @@ def idw_from_4d_corners(q: np.ndarray, corners: np.ndarray,
 
 
 # ======================================================================
-# 4. 分块角点预测（corner-only，每历元独立）
+# 4. 跨历元单元级批处理角点预测（真正并行：B>1）
 # ======================================================================
 
-def predict_product_grid_chunked(
-    model, sde, unique_corners: np.ndarray,
-    ctx_arrays: tuple, grid_sys_idx: int,
-    coord_norm, stec_norm, angle_norm, device,
-    chunk_size: int = 4096, verbose: bool = False,
-) -> np.ndarray:
+def _make_corner_epoch_data(ctx_arrays: tuple, corners_chunk: np.ndarray,
+                            grid_sys_idx: int) -> tuple:
     """
-    分块调用模型，对去重后的格网角点预测 STEC（原始 TECU 单位）。
-
-    角点作 target、model_stations 作 context。复用 test.py 的
-    collate_inference_batch + predict_batch，保证与 direct 推理完全一致的
-    归一化 / batch 构造 / 反向 SDE / 反归一化流程。
-
-    Args:
-        model, sde:   已加载模型与 SDE
-        unique_corners: [U, 4]  去重角点 (lat,lon,az,el)，原始单位
-        ctx_arrays:   context（model_stations）的数组元组：
-                      (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
-                       ctx_sys_ids, ctx_sat_ids, ctx_stations)
-        grid_sys_idx: 格网点统一使用的 system 索引（该历元 context 的众数系统）
-        coord_norm/stec_norm/angle_norm: 归一化器
-        device:       torch.device
-        chunk_size:   每块最多预测多少角点（防显存溢出）
-        verbose:      是否打印反向扩散进度
-    Returns:
-        corner_stec: [U]  角点预测 STEC（原始 TECU 单位）
+    将「某历元 context + 一个角点 chunk」组装成 collate_inference_batch 所需的
+    16 元组（角点作 target）。tgt_stec 为 dummy（不参与预测，仅占位）。
     """
     (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
      ctx_sys_ids, ctx_sat_ids, ctx_stations) = ctx_arrays
-
-    U = unique_corners.shape[0]
-    if U == 0:
-        return np.zeros((0,), dtype=np.float32)
-
-    corner_stec = np.empty(U, dtype=np.float32)
-    n_chunks = (U + chunk_size - 1) // chunk_size
-
-    for ci in range(n_chunks):
-        s = ci * chunk_size
-        e = min(s + chunk_size, U)
-        chunk = unique_corners[s:e]  # [m, 4]
-        m = chunk.shape[0]
-
-        # 角点作 target。tgt_stec 为 dummy（label 不参与预测，predict_batch
-        # 内部会用噪声覆盖 target 位置；仅用于占位以复用 collate）。
-        tgt_lats = chunk[:, 0].astype(np.float32)
-        tgt_lons = chunk[:, 1].astype(np.float32)
-        tgt_az   = chunk[:, 2].astype(np.float32)
-        tgt_el   = chunk[:, 3].astype(np.float32)
-        tgt_stec = np.zeros(m, dtype=np.float32)                 # dummy label
-        tgt_sys  = np.full(m, grid_sys_idx, dtype=np.int64)      # 统一系统索引
-        tgt_sat  = np.full(m, -1, dtype=np.int64)                # dummy 卫星号
-        tgt_stations = ["__grid__"] * m                          # dummy 站名
-
-        epoch_data = (
-            ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
+    m = corners_chunk.shape[0]
+    tgt_lats = corners_chunk[:, 0].astype(np.float32)
+    tgt_lons = corners_chunk[:, 1].astype(np.float32)
+    tgt_az   = corners_chunk[:, 2].astype(np.float32)
+    tgt_el   = corners_chunk[:, 3].astype(np.float32)
+    tgt_stec = np.zeros(m, dtype=np.float32)
+    tgt_sys  = np.full(m, grid_sys_idx, dtype=np.int64)
+    tgt_sat  = np.full(m, -1, dtype=np.int64)
+    tgt_stations = ["__grid__"] * m
+    return (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
             ctx_sys_ids, ctx_sat_ids, ctx_stations,
             tgt_lats, tgt_lons, tgt_az, tgt_el, tgt_stec,
-            tgt_sys, tgt_sat, tgt_stations,
-        )
+            tgt_sys, tgt_sat, tgt_stations)
+
+
+def _estimate_product_batch_size(repr_points: int, device,
+                                 max_batch: int = 32) -> int:
+    """
+    依据 GPU 可用显存与代表性单点序列长度，估算 product 单元级 batch size。
+
+    repr_points: 单个预测单元的代表性点数（≈ n_ctx + chunk_size）。
+    CPU 设备直接返回 1。经验：reverse_sde 单点激活 ≈ 32KB（含 T 步 + 强弱双分支）。
+    """
+    if device.type != "cuda":
+        return 1
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    bytes_per_point = 256 * 4 * 4 * 8          # ≈ 32KB/点（保守）
+    usable = free_bytes * 0.7
+    per_sample = max(repr_points, 1) * bytes_per_point
+    bs = int(usable // per_sample)
+    return max(1, min(bs, max_batch))
+
+
+def predict_corner_units_batched(
+    model, sde, units: list,
+    coord_norm, stec_norm, angle_norm, device,
+    product_batch_size: int, verbose: bool = False,
+) -> list:
+    """
+    单元级批处理：将多个预测单元（可来自不同历元）打包成 B>1 的 batch，
+    一次 collate_inference_batch + predict_batch 并行处理，充分利用 GPU。
+
+    Args:
+        units: list of dict，每个含 "epoch_data"（_make_corner_epoch_data 输出）
+        product_batch_size: 每个 batch 打包多少个单元
+    Returns:
+        preds: list（与 units 等长），每元素为该单元角点预测 STEC [m]（原始 TECU）
+    """
+    n_units = len(units)
+    preds = [None] * n_units
+    if n_units == 0:
+        return preds
+
+    nb = (n_units + product_batch_size - 1) // product_batch_size
+    for bi in range(nb):
+        s = bi * product_batch_size
+        e = min(s + product_batch_size, n_units)
+        batch_eds = [units[k]["epoch_data"] for k in range(s, e)]
 
         batch_tensors, meta_list = collate_inference_batch(
-            [epoch_data], coord_norm, stec_norm, angle_norm, device)
+            batch_eds, coord_norm, stec_norm, angle_norm, device)
         result_dfs = predict_batch(
             model, sde, batch_tensors, meta_list, stec_norm, device, verbose)
 
-        # predict_batch 的 target 顺序与输入一致，pred_stec 即角点预测
-        corner_stec[s:e] = result_dfs[0]["pred_stec"].values.astype(np.float32)
+        for j, k in enumerate(range(s, e)):
+            preds[k] = result_dfs[j]["pred_stec"].values.astype(np.float32)
 
-        # 及时释放
         del batch_tensors, meta_list, result_dfs
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    return corner_stec
+        if (bi + 1) % 5 == 0 or (bi + 1) == nb:
+            print(f"  [product-batch {bi+1}/{nb}] 已预测 {e}/{n_units} 个角点块")
+
+    return preds
 
 
 def _normalize_4d(pts: np.ndarray, coord_norm, angle_norm) -> np.ndarray:
@@ -368,15 +376,17 @@ def run_product_evaluation(
     coord_norm, stec_norm, angle_norm, device, verbose=False,
 ):
     """
-    product / grid-product 评估主入口。
+    product / grid-product 评估主入口（单元级跨历元批处理，B>1 并行）。
 
-    逐历元执行：
-      1. 提取 context(model_stations) 与 val(val_stations) 数组；
-      2. 为该历元构建 4D 格网轴（不区分卫星）；
-      3. corner-only：收集 val 点所在 cell 的去重角点；
-      4. 模型分块预测这些角点 STEC（context=model_stations）；
-      5. 每个 val 点用其 16 角点 IDW 插值得到 product_pred_STEC；
-      6. 聚合 val 级预测，越界点跳过并计数。
+    三阶段执行：
+      阶段A（CPU 轻量）：逐历元提取 context/val，建 4D 格网轴，corner-only
+                         收集去重角点，按 chunk_size 切成「预测单元」。
+                         每个单元 = (该历元 context + 一个角点 chunk)。
+      阶段B（GPU 并行）：将所有单元（可跨不同历元）按 product_batch_size 打包成
+                         B>1 的 batch，一次 reverse_sde 并行处理，充分利用显存。
+      阶段C（CPU 轻量）：把角点预测散射回各历元，逐 val 点 16 角点 IDW 插值。
+
+    核心约束不变：val IPP 绝不直接预测；仅格网角点作 target；越界点跳过。
 
     Returns:
         val_results_df: DataFrame（val 级：label / product_pred / 误差 / 元信息）
@@ -391,13 +401,17 @@ def run_product_evaluation(
     az_n,  el_n  = len(axes["az"]),  len(axes["el"])
     theoretical_total = lat_n * lon_n * az_n * el_n
 
-    all_rows = []
     total_val = 0
-    valid_val = 0
     skipped = 0
     total_corners_evaluated = 0
 
+    # ------------------------------------------------------------------
+    # 阶段 A：逐历元准备预测单元（不触碰 GPU）
+    # ------------------------------------------------------------------
     n_epochs = len(valid_epochs)
+    epoch_records = []   # 每历元一条：保留 IDW 所需的元信息
+    units = []           # 所有预测单元（跨历元）；每个含 epoch_data + 归属
+
     for ei, stem in enumerate(valid_epochs):
         model_df = pd.read_csv(model_files[stem])
         val_df   = pd.read_csv(val_files[stem])
@@ -415,7 +429,6 @@ def run_product_evaluation(
         if len(tgt_lats) == 0 or len(ctx_lats) == 0:
             continue
 
-        # 格网点统一 system 索引：取 context 众数系统（单系统场景天然一致）
         if len(ctx_sys_ids) > 0:
             grid_sys_idx = int(np.bincount(ctx_sys_ids.astype(np.int64)).argmax())
         else:
@@ -424,59 +437,114 @@ def run_product_evaluation(
         ctx_arrays = (ctx_lats, ctx_lons, ctx_az, ctx_el, ctx_stec,
                       ctx_sys_ids, ctx_sat_ids, ctx_stations)
 
-        # val 点 4D 坐标（原始单位）
         val_pts = np.stack([tgt_lats, tgt_lons, tgt_az, tgt_el], axis=-1).astype(np.float64)
 
-        # corner-only：收集去重角点 + 每个 val 点的 16 角点索引
+        # corner-only：去重角点 + 每个 val 点的 16 角点索引
         unique_corners, val_corner_idx, n_skip = collect_required_product_corners(val_pts, axes)
         skipped += n_skip
         total_corners_evaluated += unique_corners.shape[0]
+        total_val += len(tgt_lats)
 
-        # 模型预测去重角点 STEC（原始 TECU）
-        corner_stec = predict_product_grid_chunked(
-            model, sde, unique_corners, ctx_arrays, grid_sys_idx,
-            coord_norm, stec_norm, angle_norm, device,
-            chunk_size=chunk_size, verbose=verbose,
-        )
+        U = unique_corners.shape[0]
+        rec = {
+            "stem": stem,
+            "unique_corners": unique_corners,
+            "val_corner_idx": val_corner_idx,
+            "val_pts": val_pts,
+            "tgt_lats": tgt_lats, "tgt_lons": tgt_lons,
+            "tgt_az": tgt_az, "tgt_el": tgt_el, "tgt_stec": tgt_stec,
+            "tgt_sys_ids": tgt_sys_ids, "tgt_sat_ids": tgt_sat_ids,
+            "tgt_stations": tgt_stations,
+            "n_corners": U,
+            "corner_stec": (np.empty(U, dtype=np.float32) if U > 0 else
+                            np.zeros((0,), dtype=np.float32)),
+            "ctx_n": len(ctx_lats),
+        }
+        ei_rec = len(epoch_records)
+        epoch_records.append(rec)
 
-        # 归一化角点与 val 点（IDW 距离用归一化空间）
+        # 将该历元的去重角点按 chunk_size 切成预测单元
+        n_chunks = (U + chunk_size - 1) // chunk_size if U > 0 else 0
+        for ci in range(n_chunks):
+            cs = ci * chunk_size
+            ce = min(cs + chunk_size, U)
+            corners_chunk = unique_corners[cs:ce]
+            units.append({
+                "epoch_data": _make_corner_epoch_data(ctx_arrays, corners_chunk, grid_sys_idx),
+                "rec_idx": ei_rec,
+                "corner_slice": (cs, ce),
+            })
+
+        if (ei + 1) % 20 == 0 or (ei + 1) == n_epochs:
+            print(f"  [product 阶段A {ei+1}/{n_epochs}] 已准备单元 {len(units)} 个")
+
+    # ------------------------------------------------------------------
+    # 阶段 B：单元级批处理预测（GPU 并行 B>1）
+    # ------------------------------------------------------------------
+    # 代表性单点序列长度 ≈ 平均 ctx 点数 + chunk_size
+    if epoch_records:
+        avg_ctx = int(np.mean([r["ctx_n"] for r in epoch_records]))
+    else:
+        avg_ctx = 0
+    repr_points = avg_ctx + chunk_size
+    product_batch_size = _estimate_product_batch_size(repr_points, device)
+    print(f"\n  [product 阶段B] 单元总数={len(units)}，"
+          f"代表性点数≈{repr_points}，product_batch_size={product_batch_size}")
+
+    unit_preds = predict_corner_units_batched(
+        model, sde, units, coord_norm, stec_norm, angle_norm, device,
+        product_batch_size=product_batch_size, verbose=verbose,
+    )
+
+    # 角点预测散射回各历元
+    for u, pred in zip(units, unit_preds):
+        if pred is None:
+            continue
+        cs, ce = u["corner_slice"]
+        epoch_records[u["rec_idx"]]["corner_stec"][cs:ce] = pred
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # 阶段 C：逐历元 16 角点 IDW 插值（CPU 轻量）
+    # ------------------------------------------------------------------
+    all_rows = []
+    valid_val = 0
+    for rec in epoch_records:
+        stem = rec["stem"]
+        unique_corners = rec["unique_corners"]
+        corner_stec = rec["corner_stec"]
+        val_corner_idx = rec["val_corner_idx"]
+        val_pts = rec["val_pts"]
+
         if unique_corners.shape[0] > 0:
             corners_norm = _normalize_4d(unique_corners, coord_norm, angle_norm)
         val_pts_norm = _normalize_4d(val_pts, coord_norm, angle_norm)
 
-        # 逐 val 点 IDW
-        for vi in range(len(tgt_lats)):
-            total_val += 1
+        for vi in range(len(rec["tgt_lats"])):
             idx16 = val_corner_idx[vi]
             if idx16 is None:
                 continue  # out_of_grid，跳过（不外推）
-            q = val_pts_norm[vi]                    # [4] 归一化
-            c16 = corners_norm[idx16]               # [16,4]
-            s16 = corner_stec[idx16]                # [16]
+            q = val_pts_norm[vi]
+            c16 = corners_norm[idx16]
+            s16 = corner_stec[idx16]
             pred = idw_from_4d_corners(q, c16, s16, p=idw_power)
-            true = float(tgt_stec[vi])
+            true = float(rec["tgt_stec"][vi])
             valid_val += 1
             all_rows.append({
                 "epoch_time":    stem,
-                "station_name":  tgt_stations[vi],
-                "ipp_latitude":  float(tgt_lats[vi]),
-                "ipp_longitude": float(tgt_lons[vi]),
-                "azimuth_deg":   float(tgt_az[vi]),
-                "elevation_deg": float(tgt_el[vi]),
-                "system_id":     int(tgt_sys_ids[vi]),
-                "satellite_id":  int(tgt_sat_ids[vi]),
+                "station_name":  rec["tgt_stations"][vi],
+                "ipp_latitude":  float(rec["tgt_lats"][vi]),
+                "ipp_longitude": float(rec["tgt_lons"][vi]),
+                "azimuth_deg":   float(rec["tgt_az"][vi]),
+                "elevation_deg": float(rec["tgt_el"][vi]),
+                "system_id":     int(rec["tgt_sys_ids"][vi]),
+                "satellite_id":  int(rec["tgt_sat_ids"][vi]),
                 "true_stec":     true,
                 "pred_stec":     pred,
                 "abs_error":     abs(pred - true),
             })
-
-        # 及时释放当前历元角点预测
-        del unique_corners, corner_stec
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        if (ei + 1) % 10 == 0 or (ei + 1) == n_epochs:
-            print(f"  [product {ei+1}/{n_epochs}] 已处理历元，valid_val={valid_val} skipped={skipped}")
 
     val_results_df = pd.DataFrame(all_rows)
     stats = {
@@ -490,6 +558,8 @@ def run_product_evaluation(
         "valid_val_points": valid_val,
         "skipped_out_of_grid_points": skipped,
         "chunk_size": chunk_size,
+        "product_batch_size": product_batch_size,
+        "n_prediction_units": len(units),
         "idw_power": idw_power,
         "whether_corner_only_optimization_enabled": corner_only,
     }

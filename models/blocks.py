@@ -142,18 +142,20 @@ class STECAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Padding 置零：不传 mask 给 SDPA，让 Flash Attention 后端可用
-        # padding K/V = 0 → valid Q 对 padding K 的点积为 0，softmax 分配少量权重，
-        # 但 V=0 所以贡献为零，仅产生微小的注意力稀释（类似 dropout 效果）
+        # Padding 屏蔽：给 SDPA 传 attn_mask，softmax 对 padding key 完全不分配权重。
+        # 相比"置零 K/V 不传 mask"的旧方案，这里彻底消除 padding 数量差异导致的
+        # 注意力稀释偏差，使 B>1 打包推理与 B=1 逐样本推理数值一致。
+        # 代价：传 attn_mask 时 SDPA 回退到 MATH/Efficient 后端（非 Flash），
+        # 但保证了不同 batch 组合下结果不变，精度优先。
+        attn_mask = None
         if pad_mask is not None:
-            valid = (~pad_mask).float()                 # [B, N] 1=有效 0=padding
-            valid = valid[:, None, :, None]             # [B, 1, N, 1] 广播到 [B, H, N, D_h]
-            q = q * valid
-            k = k * valid
-            v = v * valid
+            # key 维屏蔽：padding key 不被任何 query attend
+            # [B, N] -> [B, 1, 1, N]，广播到 [B, H, N, N]
+            attn_mask = (~pad_mask)[:, None, None, :]
 
         out = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=False,
         )  # [B, H, N, D_h]
